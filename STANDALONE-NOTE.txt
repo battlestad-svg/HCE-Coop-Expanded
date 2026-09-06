@@ -1,0 +1,7 @@
+HCE CO-OP EXPANDED v1.10.0 - STANDALONE
+============================================
+This package contains Co-op Expanded project files only.
+
+It does NOT include UE4SS.dll, UEHelpers, the Halo-specific UE4SS compatibility
+runtime, console adapters or other bundled runtime dependencies from the Complete
+package. Use it only with a compatible existing Halo UE4SS installation.

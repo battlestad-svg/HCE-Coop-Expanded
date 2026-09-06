@@ -1,0 +1,8 @@
+GAME PASS / WINGDK LOCAL CO-OP CREDIT
+=====================================
+Game Pass workaround direction / split-screen research: bfixer117 / HCE Revival
+Repeatable controller/sign-in sequence testing/documentation: red2k1
+
+HCE Co-op Expanded v1.10.0 supports WinGDK local split-screen through the shared
+main.lua platform-user join path plus the documented manual offline transition.
+See README-MANUAL-OFFLINE-WORKAROUND.txt for the tested sequence.

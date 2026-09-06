@@ -1,0 +1,123 @@
+HCE CO-OP EXPANDED v1.10.0
+RELEASE NOTES / PATCH NOTES
+===========================
+
+v1.10.0 builds on v1.9.0 with a strong focus on controller usability, the
+keyboard/mouse + controller setup, and smoother network play.
+
+
+HIGHLIGHTS
+----------
+- Controller Settings now includes a Co-op Expanded control layout, so the mod's
+  shortcuts can be seen directly in Halo instead of only in text documentation.
+- The keyboard/mouse + one-controller setup (Controllers=1) is much more reliable
+  on Steam, including Steam Input support for controller types that do not present
+  themselves as a normal Xbox/XInput pad.
+- Limited Respawns can now broadcast important status updates as Halo TTS speech
+  to remote players. A vanilla client can hear these announcements without having
+  Co-op Expanded installed.
+- Fixed an issue where Player 1's keyboard Escape key could stop opening pause
+  after Player 2 had used pause/settings in the keyboard/mouse + controller setup.
+
+
+CONTROLLER SETTINGS LAYOUT
+--------------------------
+Halo's existing Controller Settings page is extended in both the frontend and
+in-game pause menus. The page is titled:
+
+  CO-OP EXPANDED CONTROLS
+
+The normal Halo actions stay visible, with Co-op Expanded shortcuts shown under
+the matching buttons. This includes armor, split orientation, weapon skin,
+Perspective, Limited Respawns, respawn voice, vehicle color, and P2 join/leave.
+See CONTROLS.txt for the full quick reference.
+
+
+BETTER KEYBOARD/MOUSE + CONTROLLER SUPPORT
+------------------------------------------
+Controllers=1 uses this layout:
+
+  Player 1: keyboard/mouse
+  Player 2: first gamepad
+
+On Steam, this mode now supports both normal XInput controllers and Steam Input
+virtual controllers. It was tested with Xbox, DualSense/PS5, 8BitDo Lite 2 and
+PS3-class controllers, using both wired and wireless connections. Controllers
+were also tested both before launching Halo and when connected after reaching the
+frontend.
+
+P2 joining is more robust during startup, and the mod waits until Halo can really
+see the routed P2 controller before completing the join. This avoids cases where
+P2 existed in-game but had no usable controller input.
+
+Controllers=2 remains the default for backward compatibility:
+
+  Player 1: keyboard/mouse + controller 1
+  Player 2: controller 2
+
+
+FIXED: PLAYER 1 ESCAPE / PAUSE
+------------------------------
+In Controllers=1, Player 1 could lose normal keyboard Escape/pause behavior after
+Player 2 opened and closed pause/settings. v1.10.0 fixes this while preserving
+Player 2's active menu and letting Halo handle the actual pause-menu transition.
+
+The fix has been repeatedly tested through P2 menu/settings cycles with Player 1
+remaining on keyboard/mouse.
+
+
+LIMITED RESPAWNS VOICE FOR NETWORK PLAY
+---------------------------------------
+Limited Respawns can now announce important life and reinforcement information
+through Halo's existing chat/TTS system. This is designed to work with vanilla
+remote clients, so the other player does not need Co-op Expanded just to hear the
+announcements.
+
+Voice announcements are ON by default and controlled by host Player 1:
+
+  Controller: RB / R1 + Y / Triangle
+  Keyboard:   Ctrl + F8
+
+Announcements cover activation/current lives, lives remaining after deaths,
+reinforcement countdown milestones, the final five-second warning,
+reinforcement availability, and the no-lives/restart state.
+
+In a local-only session with no remote peer, this voice transport simply stays
+inactive. Existing HUD messages continue to work independently.
+
+
+OTHER IMPROVEMENTS AND RETAINED FEATURES
+----------------------------------------
+- More reliable P2 A/Cross joining during frontend/startup timing changes.
+- Existing armor switching, weapon skins, split orientation, Perspective and
+  vehicle-color features are retained.
+- Limited Respawns remains host-authoritative in network play.
+- Vehicle-color networking remains on protocol 3; the existing synchronized
+  Warthog/Scorpion behavior is unchanged.
+- Custom vehicle-color traffic is still sent only to compatible modded peers;
+  vanilla/unverified peers are not sent custom color messages.
+- The tested Perspective helper binaries are unchanged from the validated test build.
+- The tested adaptive controller router and project-owned XInput proxy binaries
+  are unchanged from the validated test build.
+
+
+GAME PASS / WINGDK
+------------------
+Controllers=1 is supported on Xbox App / PC Game Pass with a native Xbox/XInput
+controller. PlayStation-family and other non-native/Steam-Input-style controller
+routes are not supported in this mode on WinGDK in v1.10.0.
+
+The documented manual-offline mission-start workflow is still required for local
+split-screen campaign on Game Pass. See the included GamePass-WinGDK guide.
+
+
+KNOWN ISSUES
+------------
+- Game Pass Controllers=1 supports native Xbox/XInput only.
+- Game Pass still uses the documented manual-offline mission-start workflow.
+- FSR may shimmer in P2 split view on some surfaces; TSR/DLSS/XeSS can help.
+- Frame Generation may show unusual P2 ghosting/artifacts on some systems.
+- Complex hybrid network + local-split sessions can occasionally require a full
+  Halo restart before reconnecting.
+
+See KNOWN-ISSUES.txt for details.

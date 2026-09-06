@@ -1,0 +1,70 @@
+HCE CO-OP EXPANDED v1.10.0 - CONTROLS
+==========================================
+
+CONTROLLER SETTINGS PAGE
+------------------------
+Co-op Expanded extends Halo's existing Controller Settings page in both the
+frontend and in-game local-player pause menus.
+
+Page title:
+  CO-OP EXPANDED CONTROLS
+
+The normal Halo action remains first. The Co-op Expanded shortcut is displayed
+beneath it where applicable. The in-game labels intentionally use concise
+Xbox-style button names (RB, A, X, LS, RS, etc.) so one stable text layout works
+across the PC controller paths.
+
+Controller diagram additions:
+  RB             - Co-op Expanded modifier
+  RB + D-pad Up  - Respawn Limit (host P1)
+  RB + D-pad Left  - Previous Armor
+  RB + D-pad Down  - Split Orientation
+  RB + D-pad Right - Next Armor
+  RB + X         - Weapon Skin
+  RB + B         - 1st / 3rd Person
+  A              - Menu: Join P2 / hold to leave P2
+  RB + Y         - Respawn Voice ON/OFF (host P1)
+  RB + LS        - Previous Vehicle Color
+  RB + RS        - Next Vehicle Color
+
+CONTROLLERS=2 - DEFAULT
+-----------------------
+  Player 1: keyboard/mouse and controller 1
+  Player 2: controller 2
+
+This remains the default for backward compatibility.
+
+CONTROLLERS=1
+-------------
+  Player 1: keyboard/mouse
+  Player 2: first gamepad
+
+Steam / Win64:
+  The adaptive native router supports native Xbox/XInput and Steam Input virtual
+  controllers. v1.10.0 release testing includes Xbox, DualSense/PS5,
+  8BitDo Lite 2 and PS3-class controllers, including wired and wireless use and
+  connection both before Halo launch and after the frontend is already loaded.
+
+Xbox App / PC Game Pass / WinGDK:
+  Controllers=1 uses native Xbox/XInput only. PlayStation and other non-native
+  controller families are not supported in this mode on Game Pass.
+
+P1 ESC / PAUSE RECOVERY IN CONTROLLERS=1
+-----------------------------------------
+After P2 has used its pause/settings stack, Halo can stop routing keyboard Escape
+to P1 even though keyboard input itself remains alive. Co-op Expanded now leaves
+the physical Escape press untouched, waits briefly for Halo's native route, and
+only if that route fails re-enters through Halo's own fullscreen OptionsMenu path
+for the live P1 controller. P2's active menu ownership is never overridden.
+
+KEYBOARD QUICK REFERENCE - P1
+-----------------------------
+  Ctrl+Y               - create P2 fallback
+  Ctrl+U               - remove P2 in frontend
+  Ctrl+Left / Right    - armor
+  Ctrl+Up              - Limited Respawns
+  Ctrl+Down            - split orientation
+  Ctrl+X               - weapon skin
+  Ctrl+PageUp/PageDown - vehicle color
+  Ctrl+B               - Perspective
+  Ctrl+F8              - Limited Respawns voice broadcast ON/OFF

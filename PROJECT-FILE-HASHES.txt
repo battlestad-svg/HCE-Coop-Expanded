@@ -1,0 +1,16 @@
+HCE CO-OP EXPANDED v1.10.0 - PROJECT FILE SHA-256
+===================================================
+dc1bccf8c25e57b7e5045f73edfd70e2cfaaee053184cc3cfdb484f12664dc87  HaloSplitscreenCoop/Scripts/main.lua
+1689b3183af3f18a588c5bb3be9582f8fa3c6e076e667aa6155554c8ca20c8f1  HaloSplitscreenCoop/HCEPerspectiveNative.dll
+8577dace45a3114c4e13ce10fce1c87931715406a7c5d2c0086d74ac1920973c  HaloSplitscreenCoop/HCEPerspectiveContextShift.dll
+ac8dcb15f8443ff6b4487eb17bcc2e1070d8142d33166a6d8dab080895f935c7  HaloSplitscreenCoop/HCEXInputSteamBypass.dll
+48365712b6e187ec9e59fb9942a031a95cc61cc5138083d00c9e96595d7ff32a  xinput1_4.dll / project-owned local XInput route
+2aa4da9f45c2d093dd6a2aaaaa0bd8a8258e2fe0585b0b42c6d72763ac5241f2  HaloSplitscreenCoop/settings.ini
+
+Steam-Win64 and GamePass-WinGDK contain byte-identical copies of the
+project Lua/native/config files listed above. Paths differ only because Halo
+uses Win64 on Steam and WinGDK on Xbox App / PC Game Pass.
+
+The native helper/router/XInput hashes are preserved from the fully tested
+pre-release build. For final v1.10.0, main.lua and settings.ini differ from the
+validated baseline only in release-identification/documentation text/comments.

@@ -1,0 +1,33 @@
+HCE CO-OP EXPANDED v1.10.0 - PACKAGE FILE SHA-256
+=================================================
+Generated from the exact final release directory.
+Paths are relative to this package root.
+
+c27a739230c7c76ddbc99bdb0a4cc0ba4d0eb65c86b50f6b246622d87f25a5b4  ./BEANZROD_PERSPECTIVE_LICENSE.txt
+f02a47dada8ded47a3d7bc1f7d0eca9f5b9873acd7f4bc5fb4f0cde30b24f87e  ./CONTROLS.txt
+4a11ddf9da5cfe5ca3ecb2da7e815bb02905444796fe0dcf7a34be8bc88d4a2e  ./GamePass-WinGDK/CREDITS.txt
+8577dace45a3114c4e13ce10fce1c87931715406a7c5d2c0086d74ac1920973c  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/HCEPerspectiveContextShift.dll
+1689b3183af3f18a588c5bb3be9582f8fa3c6e076e667aa6155554c8ca20c8f1  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/HCEPerspectiveNative.dll
+ac8dcb15f8443ff6b4487eb17bcc2e1070d8142d33166a6d8dab080895f935c7  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/HCEXInputSteamBypass.dll
+dc1bccf8c25e57b7e5045f73edfd70e2cfaaee053184cc3cfdb484f12664dc87  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/Scripts/main.lua
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/enabled.txt
+2aa4da9f45c2d093dd6a2aaaaa0bd8a8258e2fe0585b0b42c6d72763ac5241f2  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/ue4ss/Mods/HaloSplitscreenCoop/settings.ini
+48365712b6e187ec9e59fb9942a031a95cc61cc5138083d00c9e96595d7ff32a  ./GamePass-WinGDK/Meteorite/Binaries/WinGDK/xinput1_4.dll
+db313cf4cd060f36ef0ce4b960da9a48c6348ab82517bdf73562048e96f8c10f  ./GamePass-WinGDK/README-MANUAL-OFFLINE-WORKAROUND.txt
+ab47961efb85dcd2329806d0a07b245d6918ca3fc87d149c0bc3498c3b19b2c7  ./HCE_REVIVAL_LICENSE.txt
+8f5c2634e71d3b56219931e336d120e5c39286babdbcccb7eae062c72951b06d  ./KNOWN-ISSUES.txt
+da489cac723e4cd6e1af81711892590fdac1419279bbee804fee3fd21ce0706f  ./LICENSE.txt
+2ccea6b3ce7dfd2544e3839115cae766ff064710139f75be7cc2eb9a54f5df03  ./PROJECT-FILE-HASHES.txt
+7a8407629e5f1117d11b8a7c7e577132ae2162f6646e4b2dfcad00c52629b4d9  ./README-INSTALL.txt
+d6edcf83b4aad0a4abdb6c852b294d32ef8372e2c84b9acd98c4e80765a13ae4  ./README.txt
+94281ff4cb2cc45d51f9580e84465cd0899a1881358278e4eb73f9ae943118e1  ./RELEASE-NOTES-v1.10.0.txt
+69b7160602325c3f0824e4a0891e96980d884c854fe247aa8de1d787fb8bf447  ./SECURITY.md
+00feba211664c9b0c0a495e8d5812a2334df092344deb19a4989833f00fb7085  ./STANDALONE-NOTE.txt
+8577dace45a3114c4e13ce10fce1c87931715406a7c5d2c0086d74ac1920973c  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/HCEPerspectiveContextShift.dll
+1689b3183af3f18a588c5bb3be9582f8fa3c6e076e667aa6155554c8ca20c8f1  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/HCEPerspectiveNative.dll
+ac8dcb15f8443ff6b4487eb17bcc2e1070d8142d33166a6d8dab080895f935c7  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/HCEXInputSteamBypass.dll
+dc1bccf8c25e57b7e5045f73edfd70e2cfaaee053184cc3cfdb484f12664dc87  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/Scripts/main.lua
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/enabled.txt
+2aa4da9f45c2d093dd6a2aaaaa0bd8a8258e2fe0585b0b42c6d72763ac5241f2  ./Steam-Win64/Meteorite/Binaries/Win64/ue4ss/Mods/HaloSplitscreenCoop/settings.ini
+48365712b6e187ec9e59fb9942a031a95cc61cc5138083d00c9e96595d7ff32a  ./Steam-Win64/Meteorite/Binaries/Win64/xinput1_4.dll
+7a113409161ad0e86dae707fd00724dc726d7ee9126b7ec992cbda88366e6b11  ./THIRD_PARTY_NOTICES.txt

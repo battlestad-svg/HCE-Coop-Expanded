@@ -1,0 +1,39 @@
+HCE CO-OP EXPANDED v1.10.0 - KNOWN ISSUES
+==============================================
+
+GAME PASS / WINGDK CONTROLLERS=1
+--------------------------------
+Controllers=1 on Xbox App / PC Game Pass is supported only with a native
+Xbox/XInput controller. PlayStation-family controllers, 8BitDo devices operating
+through non-native mappings, and other Steam-Input-style virtual-controller paths
+are not supported on WinGDK in v1.10.0.
+
+This remains a documented limitation in v1.10.0.
+
+GAME PASS MISSION START
+-----------------------
+The existing manual offline transition remains part of the documented Game Pass
+local-coop workflow. Join P2 in the lobby first, go offline before mission start,
+and reconnect after the local split-screen mission is visibly loaded. See the
+GamePass-WinGDK guide included in the archive.
+
+If P2 loads to a black screen, fully exit Halo and retry the complete sequence
+from a fresh process.
+
+HYBRID NETWORK SESSION RECONNECT
+--------------------------------
+After leaving a complex network + local-split session, Halo's own online session
+state can occasionally refuse an immediate reconnect. A full Halo restart is the
+reliable recovery if repeated reconnect attempts fail.
+
+RENDERING
+---------
+FSR can produce persistent shimmering/fine noise in P2's split view on some
+detailed surfaces. TSR, DLSS or XeSS may avoid the artifact.
+
+Frame Generation can produce unusual P2 ghosting/artifacts on some systems.
+
+RUNTIME COMPATIBILITY
+---------------------
+The Complete package's bundled Halo-specific UE4SS runtime targets the game build
+listed in README.txt / README-HaloCampaignEvolved.txt.

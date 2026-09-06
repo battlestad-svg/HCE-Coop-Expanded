@@ -1,0 +1,38 @@
+HCE CO-OP EXPANDED v1.10.0 - THIRD-PARTY NOTICES
+================================================
+
+RE-UE4SS
+--------
+The Complete-UE4SS package redistributes the tested Halo compatibility runtime
+based on UE4SS v3.0.1 Beta #0 (Git c838a8ac), under its included MIT license.
+Project: https://github.com/UE4SS-RE/RE-UE4SS
+
+UPSTREAM HALO SPLIT-SCREEN WORK
+-------------------------------
+HCE Co-op Expanded builds on Halo Campaign Evolved Split-screen Coop by
+JPurd123 and the RE-UE4SS SplitScreenMod example by Narknon. The upstream MIT
+license and credited JoacoL999 / joaqo455 contributions are retained in
+LICENSE.txt.
+
+HCE REVIVAL
+-----------
+HCE Revival by bfixer117 informed HUD anchoring, Halo-native load confirmation,
+one-controller routing, and the Game Pass local-coop workaround direction/foundation
+used by HCE Co-op Expanded. Its MIT license is included as
+HCE_REVIVAL_LICENSE.txt.
+
+HCE Co-op Expanded uses its own project-owned XInput routing components rather
+than redistributing another project's XInput binary. The adaptive router source
+for this release is included in the Source Snapshot.
+
+PERSPECTIVE REFERENCE
+---------------------
+beanzrod's Instant 1st to 3rd Person Toggle project was used as a technical
+reference while researching live Perspective behavior. Its MIT notice is
+included as BEANZROD_PERSPECTIVE_LICENSE.txt. Its runtime DLL is not included.
+
+GAME PASS TESTING / WORKAROUND CREDIT
+-------------------------------------
+The manual WinGDK offline-transition workaround direction/foundation is credited to
+bfixer117 / HCE Revival. red2k1 is credited for documenting/testing the
+repeatable controller and sign-in sequence used by HCE Co-op Expanded.
