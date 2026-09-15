@@ -1,5 +1,5 @@
 -- Halo: Campaign Evolved - Co-op Expanded
--- Release: v1.10.0
+-- v1.11.0 development build
 --
 -- Adds a second local player to the PC build, so campaign co-op can be played
 -- split-screen on one machine.
@@ -1248,6 +1248,10 @@ function ApplyStaticFrontendJoinPrompt(Attempt)
         if string.find(LowerWorld, "/game/levels/halo1/solo/", 1, true) then
             return
         end
+        if string.find(LowerWorld, "/game/levels/ui/frontend/", 1, true)
+            and ArmorSkinArmFrontendTexturePrewarm ~= nil then
+            pcall(function() ArmorSkinArmFrontendTexturePrewarm("frontend squad UI signal") end)
+        end
 
         -- Rebind the leave gesture to the CURRENT frontend P2 controller. A
         -- campaign PlayerController can remain UObject-valid after returning to
@@ -2027,6 +2031,10 @@ local function DestroyPlayer(Source)
     P2MenuLeaveBindingName = ""
     P2MenuLeaveHoldTicks = 0
     P2MenuLeaveHoldLatched = false
+    P2SpartanSessionName = ""
+    P2SpartanRandomState = 0
+    IdentityFrontendNameLastSignature = ""
+    IdentityFrontendNamePublishToken = (tonumber(IdentityFrontendNamePublishToken) or 0) + 1
     ApplySoloMenuState()
     ResetRespawnSessionBoundary(LeaveSource .. " local P2 removal")
     Log("SESSION local P2 cleanup complete: mod-owned join verification/perspective state cleared; Halo fireteam/online-session state left to the game")
@@ -3209,6 +3217,12 @@ function TogglePerspectivePlayer(PlayerIndex, Source)
         Log("PERSPECTIVE P1 -> %s via %s; native call completed", Label, tostring(Source or "input"))
         ScreenMessage(1, Player, string.format("P1 %s", Label))
     end
+    if not RequestedThird and type(ArmorSkinSchedulePerspectiveFirstPersonRebind) == "function" then
+        ArmorSkinSchedulePerspectiveFirstPersonRebind(PlayerIndex,
+            string.format("perspective P%d -> first person", PlayerIndex))
+    elseif RequestedThird and ArmorSkinPerspectiveRebindToken ~= nil then
+        ArmorSkinPerspectiveRebindToken[PlayerIndex] = (tonumber(ArmorSkinPerspectiveRebindToken[PlayerIndex]) or 0) + 1
+    end
     return true
 end
 
@@ -3621,7 +3635,7 @@ function VehicleMessageApplyRemoteScorpionColor(Vehicle, GameStateId, ColorIndex
         local Plan = ScorpionDiscoverPaintPlan(Vehicle)
         if type(Plan) ~= 'table' or #Plan == 0 then return false, 'no Scorpion paint plan' end
         local IsOriginal = ColorIndex == 0
-        local Color = IsOriginal and nil or WarthogCEColors[ColorIndex]
+        local Color = IsOriginal and nil or ScorpionCEColors[ColorIndex]
         if not IsOriginal and Color == nil then return false, 'missing color definition' end
         local ApplyOk, AppliedMIDs, Failures = ScorpionApplyPaintPlan(Plan, Color, IsOriginal)
         if ApplyOk == true then
@@ -3708,6 +3722,9 @@ function VehicleMessageHandleClientMessage(Context, StringParam, TypeParam, Life
     local IsColor = string.sub(Message, 1, 8) == "HCECEVC|"
     local IsCapability = string.sub(Message, 1, 9) == "HCECECAP|"
     local IsLives = string.sub(Message, 1, 8) == "HCECELV|"
+    -- v1.11.0 native Classic12 cleanup: armor customization now uses cooked
+    -- native rows and Halo's ordinary replication. The retired HCECEA* custom
+    -- armor transport is deliberately not recognized here.
     if not IsColor and not IsCapability and not IsLives then return end
 
     local Controller = Unwrap(Context)
@@ -3881,7 +3898,10 @@ function VehicleMessageHandleServerExecRPC(Context, StringParam)
     local Message = VehicleMessageValueToString(StringParam)
     local IsCapability = string.sub(Message, 1, 9) == "HCECECAP|"
     local IsUplink = string.sub(Message, 1, 8) == "HCECEUP|"
-    if not IsCapability and not IsUplink then return end
+    local IsIdentityNameUplink = string.sub(Message, 1, 8) == "HCECENM|"
+    -- v1.11.0 native Classic12 cleanup: HCECEAC/AU/AR/PV belonged to the
+    -- abandoned custom armor-sync transport and are no longer dispatched.
+    if not IsCapability and not IsUplink and not IsIdentityNameUplink then return end
 
     local Controller = Unwrap(Context)
     local IsLocal = false
@@ -3896,12 +3916,24 @@ function VehicleMessageHandleServerExecRPC(Context, StringParam)
         Log("VEHNET v1.9.0 UPLINK local dispatch observed; waiting for server receive message=%s", Message)
         return
     end
+    local ControllerToken = SafeFullName(Controller) or tostring(Controller)
+
+    -- RC3_54: P2 identity is useful in the fireteam frontend before the mission
+    -- authority/capability state machine exists. A client-side reflected call was
+    -- already rejected above by IsLocal, so this non-local copy is the server-side
+    -- RPC. Keep this early exception narrow: only the validated P2-name payload is
+    -- allowed before the normal mission authority gate.
+    if IsIdentityNameUplink then
+        if IdentityNetworkHandleNameUplink ~= nil then
+            IdentityNetworkHandleNameUplink(Message, Controller, ControllerToken)
+        end
+        return
+    end
+
     if not LivesAuthorityResolved or not LivesAuthorityAllowed then
         Log("VEHNET v1.9.0 UPLINK ignored on non-authority process message=%s", Message)
         return
     end
-
-    local ControllerToken = SafeFullName(Controller) or tostring(Controller)
     if IsCapability then
         local Proto, Command = string.match(Message, "^HCECECAP|(%d+)|([A-Z]+)$")
         Proto = tonumber(Proto)
@@ -4466,6 +4498,7 @@ WarthogHybridDriverVehicleP2 = WarthogHybridDriverVehicleP2 or nil
 -- MID can never redefine the meaning of ORIGINAL.
 WarthogOriginalColorValueCache = WarthogOriginalColorValueCache or {}
 KeyboardPendingVehicleColorDelta = KeyboardPendingVehicleColorDelta or 0
+KeyboardPendingClassicSkinDelta = KeyboardPendingClassicSkinDelta or 0
 
 function InvalidateWarthogColorRuntime(Reason, PreserveColorCarry)
     WarthogColorRuntimeGeneration = (tonumber(WarthogColorRuntimeGeneration) or 0) + 1
@@ -4503,6 +4536,9 @@ function InvalidateWarthogColorRuntime(Reason, PreserveColorCarry)
     VehicleMessageCapabilityMissionPrimed = false
     VehicleMessageOfflineFastPath = false
     VehicleMessageUplinkSequence = 0
+    if ArmorSkinDropAllRuntimeRefs ~= nil then
+        ArmorSkinDropAllRuntimeRefs("vehicle runtime invalidation: " .. tostring(Reason or "unknown"))
+    end
     LivesNetworkResetRemoteState("vehicle runtime invalidation: " .. tostring(Reason or "unknown"))
     KeyboardPendingVehicleColorDelta = 0
 end
@@ -4541,16 +4577,18 @@ function ResetWarthogColorState(Reason)
     VehicleMessageCapabilityMissionPrimed = false
     VehicleMessageOfflineFastPath = false
     VehicleMessageUplinkSequence = 0
+    if ArmorSkinResetSessionState ~= nil then
+        ArmorSkinResetSessionState("vehicle/session reset: " .. tostring(Reason or "unknown"))
+    end
     LivesNetworkResetRemoteState("vehicle/session reset: " .. tostring(Reason or "unknown"))
     KeyboardPendingVehicleColorDelta = 0
 end
 
-WarthogCEColors = WarthogCEColors or {
-    { Name="WHITE",  Hex="#FFFFFF", R=255, G=255, B=255 },
+WarthogCEColors = {
     { Name="BLACK",  Hex="#000000", R=0,   G=0,   B=0   },
     { Name="RED",    Hex="#FE0000", R=254, G=0,   B=0   },
     { Name="BLUE",   Hex="#0201E3", R=2,   G=1,   B=227 },
-    { Name="GRAY",   Hex="#707E71", R=112, G=126, B=113 },
+    { Name="GRAY",   Hex="#808080", R=128, G=128, B=128 },
     { Name="YELLOW", Hex="#FFFF01", R=255, G=255, B=1   },
     { Name="GREEN",  Hex="#00FF01", R=0,   G=255, B=1   },
     { Name="PINK",   Hex="#FF56B9", R=255, G=86,  B=185 },
@@ -4564,7 +4602,17 @@ WarthogCEColors = WarthogCEColors or {
     { Name="TAN",    Hex="#C69C6C", R=198, G=156, B=108 },
     { Name="MAROON", Hex="#9D0B0E", R=157, G=11,  B=14  },
     { Name="SALMON", Hex="#F5999E", R=245, G=153, B=158 },
+    { Name="WHITE",  Hex="#FFFFFF", R=255, G=255, B=255 },
 }
+
+ScorpionCEColors = {}
+for Index, Color in ipairs(WarthogCEColors) do
+    ScorpionCEColors[Index] = { Name=Color.Name, Hex=Color.Hex, R=Color.R, G=Color.G, B=Color.B }
+end
+-- Scorpion hull materials lean slightly olive with the same neutral gray used by
+-- the Warthog, so give Scorpion its own cooler/lighter GRAY to better match the
+-- Spartan classic gray armor in-game.
+ScorpionCEColors[4] = { Name="GRAY", Hex="#A0A6B5", R=160, G=166, B=181 }
 
 function WarthogRecolorClip(Value, Limit)
     local Text = tostring(Value or "")
@@ -4633,10 +4681,19 @@ function WarthogColorSRGBByteToLinear(ByteValue)
 end
 
 function WarthogColorLinear(Color)
+    local DisplayBrightness = 0.85
+    local DisplaySaturation = 0.90
+    local R = tonumber(Color.R) or 0
+    local G = tonumber(Color.G) or 0
+    local B = tonumber(Color.B) or 0
+    local Neutral = 0.299 * R + 0.587 * G + 0.114 * B
+    local function DisplayByte(Value)
+        return (Neutral + (Value - Neutral) * DisplaySaturation) * DisplayBrightness
+    end
     return {
-        R=WarthogColorSRGBByteToLinear(Color.R),
-        G=WarthogColorSRGBByteToLinear(Color.G),
-        B=WarthogColorSRGBByteToLinear(Color.B),
+        R=WarthogColorSRGBByteToLinear(DisplayByte(R)),
+        G=WarthogColorSRGBByteToLinear(DisplayByte(G)),
+        B=WarthogColorSRGBByteToLinear(DisplayByte(B)),
         A=1.0,
     }
 end
@@ -7273,7 +7330,7 @@ function ScorpionScheduleTurretRepair(PlayerIndex, VehicleKey, Attempt)
         local State = tonumber(ScorpionColorIndexByVehicle[VehicleKey])
         if State ~= nil and type(CurrentTurretPlan) == "table" and #CurrentTurretPlan > 0 then
             local IsOriginal = State == 0
-            local Color = IsOriginal and nil or WarthogCEColors[State]
+            local Color = IsOriginal and nil or ScorpionCEColors[State]
             ScorpionApplyPaintPlan(CurrentTurretPlan, Color, IsOriginal)
         end
 
@@ -7343,10 +7400,10 @@ function CycleOccupiedScorpionColor(PlayerIndex, Delta, Source)
 
     local Step = (tonumber(Delta) or 1) < 0 and -1 or 1
     local Next = Current + Step
-    if Next > #WarthogCEColors then Next = 0 end
-    if Next < 0 then Next = #WarthogCEColors end
+    if Next > #ScorpionCEColors then Next = 0 end
+    if Next < 0 then Next = #ScorpionCEColors end
     local IsOriginal = Next == 0
-    local Color = IsOriginal and nil or WarthogCEColors[Next]
+    local Color = IsOriginal and nil or ScorpionCEColors[Next]
     local Applied, AppliedMIDs, Failures = ScorpionApplyPaintPlan(Plan, Color, IsOriginal)
     if not Applied then
         Log("SCORPION COLOR apply failed vehicle=%s state=%s mids=%d failures=%d",
@@ -7372,7 +7429,7 @@ function CycleOccupiedScorpionColor(PlayerIndex, Delta, Source)
         ScreenMessage(PlayerIndex, Controller, "SCORPION COLOR: ORIGINAL")
     else
         ScreenMessage(PlayerIndex, Controller,
-            string.format("SCORPION COLOR %02d/%02d: %s", Next, #WarthogCEColors, tostring(Color.Name)))
+            string.format("SCORPION COLOR %02d/%02d: %s", Next, #ScorpionCEColors, tostring(Color.Name)))
     end
     return true
 end
@@ -7382,6 +7439,5767 @@ function CycleOccupiedVehicleColor(PlayerIndex, Delta, Source)
     return CycleOccupiedScorpionColor(PlayerIndex, Delta, Source)
 end
 
+
+-- Default Spartan armor-skin cycling -----------------------------------------
+-- v1.11.0 RC2 integrates the proven HCEArmor compact VT route directly into
+-- Co-op Expanded. Stock MI_Chief_Armor stays in place; only its layered
+-- "Diffuse Map" texture parameters are replaced on runtime MIDs.
+--
+-- The logical skin order deliberately reuses WarthogCEColors so on-foot armor
+-- and Warthog/Scorpion paint can never drift apart:
+--   0 ORIGINAL GREEN, then BLACK, RED, BLUE ... WHITE.
+-- Hold X + D-pad Left/Right (or Ctrl+PageUp/PageDown) cycles this skin list on foot.
+-- RB+LS/RS remains dedicated to Warthog/Scorpion vehicle paint.
+-- RB+D-pad Left/Right remains the separate authored armor-model browser.
+IdentityNameProtocol = 2
+ArmorSkinTextureCache = ArmorSkinTextureCache or {}
+ArmorSkinAppliedByTarget = ArmorSkinAppliedByTarget or {}
+-- V12: Classic armor is a real user selection, not merely a runtime material cache.
+-- Keep it through respawn, map/menu travel and process restarts on both Steam/Win64
+-- and GamePass/WinGDK.  The file lives beside settings.ini in the mod directory.
+ClassicArmorMenuSelectedByPlayer = ClassicArmorMenuSelectedByPlayer or { [1] = 0, [2] = 0 }
+ClassicArmorPersistentStatePath = ClassicArmorPersistentStatePath or GetModFilePath("classic_armor_state.ini")
+ClassicArmorPersistentLastSaved = ClassicArmorPersistentLastSaved or ""
+ClassicArmorPersistentLoaded = ClassicArmorPersistentLoaded == true
+
+function ClassicArmorPersistentSignature()
+    local P1 = math.max(0, math.min(#WarthogCEColors, tonumber(ClassicArmorMenuSelectedByPlayer[1]) or 0))
+    local P2 = math.max(0, math.min(#WarthogCEColors, tonumber(ClassicArmorMenuSelectedByPlayer[2]) or 0))
+    return string.format("P1=%d\nP2=%d\n", P1, P2)
+end
+
+function ClassicArmorSavePersistentState(Source)
+    if type(io) ~= "table" or type(io.open) ~= "function" then return false end
+    local Body = ClassicArmorPersistentSignature()
+    if Body == tostring(ClassicArmorPersistentLastSaved or "") then return true end
+    local F, Err = io.open(ClassicArmorPersistentStatePath, "w")
+    if not F then
+        Log("CLASSIC18V12 persistence write failed path=%s error=%s source=%s",
+            tostring(ClassicArmorPersistentStatePath), tostring(Err), tostring(Source or "selection"))
+        return false
+    end
+    F:write("# HCE Co-op Expanded Classic armor selection\n")
+    F:write(Body)
+    F:close()
+    ClassicArmorPersistentLastSaved = Body
+    Log("CLASSIC18V12 persistence saved P1=%s P2=%s source=%s",
+        ArmorSkinColorLabel and ArmorSkinColorLabel(tonumber(ClassicArmorMenuSelectedByPlayer[1]) or 0) or tostring(ClassicArmorMenuSelectedByPlayer[1]),
+        ArmorSkinColorLabel and ArmorSkinColorLabel(tonumber(ClassicArmorMenuSelectedByPlayer[2]) or 0) or tostring(ClassicArmorMenuSelectedByPlayer[2]),
+        tostring(Source or "selection"))
+    return true
+end
+
+function ClassicArmorLoadPersistentState()
+    if ClassicArmorPersistentLoaded then return true end
+    ClassicArmorPersistentLoaded = true
+    if type(io) ~= "table" or type(io.open) ~= "function" then return false end
+    local F = io.open(ClassicArmorPersistentStatePath, "r")
+    if not F then
+        ClassicArmorPersistentLastSaved = ClassicArmorPersistentSignature()
+        Log("CLASSIC18V12 persistence no prior state; using ORIGINAL GREEN")
+        return false
+    end
+    local P1, P2 = nil, nil
+    for Line in F:lines() do
+        local I, V = string.match(Line, "^%s*P([12])%s*=%s*(%d+)%s*$")
+        I, V = tonumber(I), tonumber(V)
+        if I and V and V >= 0 and V <= #WarthogCEColors then
+            if I == 1 then P1 = V elseif I == 2 then P2 = V end
+        end
+    end
+    F:close()
+    if P1 ~= nil then ClassicArmorMenuSelectedByPlayer[1] = P1 end
+    if P2 ~= nil then ClassicArmorMenuSelectedByPlayer[2] = P2 end
+    ClassicArmorPersistentLastSaved = ClassicArmorPersistentSignature()
+    Log("CLASSIC18V12 persistence loaded P1=%s P2=%s path=%s",
+        tostring(ClassicArmorMenuSelectedByPlayer[1]), tostring(ClassicArmorMenuSelectedByPlayer[2]),
+        tostring(ClassicArmorPersistentStatePath))
+    return true
+end
+
+function ClassicArmorSetPersistentSelection(PlayerIndex, ColorIndex, Source)
+    PlayerIndex = math.max(1, math.min(2, tonumber(PlayerIndex) or 1))
+    ColorIndex = math.max(0, math.min(#WarthogCEColors, tonumber(ColorIndex) or 0))
+    ClassicArmorMenuSelectedByPlayer[PlayerIndex] = ColorIndex
+    if type(ArmorSkinLocalIndexByPlayer) == "table" then ArmorSkinLocalIndexByPlayer[PlayerIndex] = ColorIndex end
+    ClassicArmorSavePersistentState(Source or "selection")
+    return ColorIndex
+end
+
+ClassicArmorLoadPersistentState()
+ArmorSkinLocalIndexByPlayer = ArmorSkinLocalIndexByPlayer or {
+    [1] = tonumber(ClassicArmorMenuSelectedByPlayer[1]) or 0,
+    [2] = tonumber(ClassicArmorMenuSelectedByPlayer[2]) or 0,
+}
+ArmorSkinLocalApplyToken = ArmorSkinLocalApplyToken or { [1] = 0, [2] = 0 }
+ArmorSkinLocalSettledToken = ArmorSkinLocalSettledToken or { [1] = 0, [2] = 0 }
+ArmorSkinMaintainCounter = ArmorSkinMaintainCounter or { [1] = 0, [2] = 0 }
+-- First-person arms are constructed on a slightly different lifecycle from the
+-- third-person biped. Keep retry/backoff state per rendered target so a color
+-- selected before the arms mesh exists can repair itself without rebuilding
+-- third-person MIDs every frame.
+ArmorSkinFirstPersonRetryByTarget = ArmorSkinFirstPersonRetryByTarget or {}
+ArmorSkinPerspectiveRebindToken = ArmorSkinPerspectiveRebindToken or { [1] = 0, [2] = 0 }
+ArmorSkinNetworkColorByPlayerId = ArmorSkinNetworkColorByPlayerId or {}
+ArmorSkinNetworkPendingTokenByPlayerId = ArmorSkinNetworkPendingTokenByPlayerId or {}
+ArmorSkinNetworkSequence = ArmorSkinNetworkSequence or 0
+ArmorSkinNetworkUplinkSequence = ArmorSkinNetworkUplinkSequence or 0
+ArmorSkinNetworkLastReceivedSequenceByPlayerId = ArmorSkinNetworkLastReceivedSequenceByPlayerId or {}
+ArmorSkinNetworkLastUplinkSequenceByController = ArmorSkinNetworkLastUplinkSequenceByController or {}
+ArmorSkinHostCapabilitySeen = ArmorSkinHostCapabilitySeen or false
+ArmorSkinCapabilityAckByController = ArmorSkinCapabilityAckByController or {}
+ArmorSkinNetworkResolveRouteByPlayerId = ArmorSkinNetworkResolveRouteByPlayerId or {}
+ArmorSkinNetworkLastPublishedLocalColorByPlayerId = ArmorSkinNetworkLastPublishedLocalColorByPlayerId or {}
+ArmorSkinUplinkControllerByPlayerId = ArmorSkinUplinkControllerByPlayerId or {}
+ArmorSkinUplinkRouteMetaByPlayerId = ArmorSkinUplinkRouteMetaByPlayerId or {}
+ArmorSkinUplinkProbeGenerationByController = ArmorSkinUplinkProbeGenerationByController or {}
+-- RC3_42: preserve the originating LOCAL slot (P1/P2) as separate network
+-- metadata. PlayerId is only an opaque replicated identity and is never used
+-- to infer split-screen slot order.
+ArmorSkinNetworkOriginSlotByPlayerId = ArmorSkinNetworkOriginSlotByPlayerId or {}
+-- RC3_49: authority-local P1->P2 render-space vector.  The authority knows
+-- exact local biped identity via Pawn.Children, so send only the relative
+-- vector; observer-specific world/presentation translation cancels out.
+ArmorSkinPairVectorSequence = ArmorSkinPairVectorSequence or 0
+ArmorSkinPairVectorUplinkSequence = ArmorSkinPairVectorUplinkSequence or 0
+ArmorSkinRemotePairVector = ArmorSkinRemotePairVector or nil
+ArmorSkinPairVectorLastSignatureByController = ArmorSkinPairVectorLastSignatureByController or {}
+ArmorSkinPairVectorLastClientUplinkSignature = ArmorSkinPairVectorLastClientUplinkSignature or ""
+ArmorSkinPairVectorLastUplinkSequenceByController = ArmorSkinPairVectorLastUplinkSequenceByController or {}
+ArmorSkinPairVectorAuditLogged = ArmorSkinPairVectorAuditLogged or {}
+ArmorSkinPairVectorRetryTokenByController = ArmorSkinPairVectorRetryTokenByController or {}
+ArmorSkinPairVectorSourceReadyGeneration = ArmorSkinPairVectorSourceReadyGeneration or -1
+ArmorSkinPairVectorReadyCheckCounter = ArmorSkinPairVectorReadyCheckCounter or 0
+ArmorSkinRespawnPairVectorToken = ArmorSkinRespawnPairVectorToken or 0
+ArmorSkinRespawnLocalReapplyToken = ArmorSkinRespawnLocalReapplyToken or 0
+ArmorSkinRespawnSettleToken = ArmorSkinRespawnSettleToken or 0
+ArmorSkinBipedWriteQuietUntilClock = tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0
+-- RC3_58: remember only the current BP_SpartansBipedActor construction burst.
+-- This lets a receiver distinguish freshly respawned remote presentation bodies
+-- from old corpses without suffix/order guesses or a global reflection scan.
+ArmorSkinFreshBipedByKey = ArmorSkinFreshBipedByKey or {}
+ArmorSkinLastBipedConstructionClock = tonumber(ArmorSkinLastBipedConstructionClock) or 0
+ArmorSkinFreshBipedWindowSeconds = 0.75
+
+-- RC3_59: old per-slot MIDs caused visible hitches even when time-sliced.
+-- Jobs now bind shared world-owned palette MIDs; expensive parameter setup occurs
+-- once per unique source-material/scope/color instead of once per armor slot.
+ArmorSkinSlicedJobsByTarget = ArmorSkinSlicedJobsByTarget or {}
+ArmorSkinSlicedJobOrder = ArmorSkinSlicedJobOrder or {}
+ArmorSkinSlicedPumpToken = tonumber(ArmorSkinSlicedPumpToken) or 0
+ArmorSkinSlicedPumpScheduled = ArmorSkinSlicedPumpScheduled or false
+ArmorSkinSlicedSerial = tonumber(ArmorSkinSlicedSerial) or 0
+-- RC3_59 shared-palette path: once a palette MID exists, slot work is only a
+-- cheap SetMaterial/GetMaterial binding operation. Process a small batch per pump
+-- so a full 38-slot Spartan completes quickly without the old per-slot MID cost.
+ArmorSkinSlicedSliceDelayMs = 8
+ArmorSkinSlicedUpdateDelayMs = 8
+ArmorSkinSlicedVerifyPasses = 2
+ArmorSkinPaletteBindBatchSize = 8
+ArmorSkinPaletteMIDByKey = ArmorSkinPaletteMIDByKey or {}
+ArmorSkinPaletteSourceByMIDKey = ArmorSkinPaletteSourceByMIDKey or {}
+ArmorSkinPaletteLibraryCache = ArmorSkinPaletteLibraryCache or nil
+ArmorSkinPaletteSerial = tonumber(ArmorSkinPaletteSerial) or 0
+ArmorSkinPaletteCreatedCount = tonumber(ArmorSkinPaletteCreatedCount) or 0
+-- RC3_60: one mutable shared MID set per logical player + stock parent/scope.
+-- Textures are already prewarmed in frontend. Color changes now mutate only these
+-- 2-3 shared MIDs; the 20/38 mesh slots remain bound to the same material objects.
+ArmorSkinPlayerMIDByKey = ArmorSkinPlayerMIDByKey or {}
+ArmorSkinPlayerMIDPrewarmToken = tonumber(ArmorSkinPlayerMIDPrewarmToken) or 0
+ArmorSkinPlayerMIDPrewarmGeneration = tonumber(ArmorSkinPlayerMIDPrewarmGeneration) or -1
+ArmorSkinPlayerMIDCreatedCount = tonumber(ArmorSkinPlayerMIDCreatedCount) or 0
+ArmorSkinPersistentPlayerMIDSerial = tonumber(ArmorSkinPersistentPlayerMIDSerial) or 0
+ArmorSkinLocalReassertToken = ArmorSkinLocalReassertToken or { [1]=0, [2]=0 }
+ArmorSkinRespawnIdentityRetryToken = tonumber(ArmorSkinRespawnIdentityRetryToken) or 0
+ArmorSkinRespawnIdentitySettledGeneration = tonumber(ArmorSkinRespawnIdentitySettledGeneration) or -1
+IdentityNameUplinkSequence = IdentityNameUplinkSequence or 0
+IdentityNameLastPublishedByPlayerId = IdentityNameLastPublishedByPlayerId or {}
+IdentityNameLastUplinkSequenceByController = IdentityNameLastUplinkSequenceByController or {}
+IdentityFrontendNamePublishToken = IdentityFrontendNamePublishToken or 0
+IdentityFrontendNameLastSignature = IdentityFrontendNameLastSignature or ""
+ArmorSkinRemoteSplitSlotAuditLogged = ArmorSkinRemoteSplitSlotAuditLogged or {}
+-- RC3_43: world travel destroys all render/MID objects, but color choice is
+-- logical fireteam state. Keep only remote logical color + explicit source slot
+-- across mission/frontend travel. Runtime PlayerId tables are still cleared,
+-- then safely repopulated only for PlayerIds that exist in the new world.
+-- PlayerId is NEVER interpreted as P1/P2; it is only an opaque identity key.
+ArmorSkinPersistentRemoteColorByPlayerId = ArmorSkinPersistentRemoteColorByPlayerId or {}
+ArmorSkinPersistentRemoteOriginSlotByPlayerId = ArmorSkinPersistentRemoteOriginSlotByPlayerId or {}
+ArmorSkinPersistentRestoreAuditGeneration = ArmorSkinPersistentRestoreAuditGeneration or -1
+ArmorSkinTexturePrewarmToken = ArmorSkinTexturePrewarmToken or 0
+ArmorSkinTexturePrewarmComplete = ArmorSkinTexturePrewarmComplete or false
+ArmorSkinTextureKeeperByColor = ArmorSkinTextureKeeperByColor or {}
+ArmorSkinTextureKeeperParent = ArmorSkinTextureKeeperParent
+ArmorSkinTextureKeeperClass = ArmorSkinTextureKeeperClass
+ArmorSkinTextureKeeperGameInstance = ArmorSkinTextureKeeperGameInstance
+ArmorSkinTexturePrewarmRequestedGeneration = ArmorSkinTexturePrewarmRequestedGeneration or -1
+ArmorSkinRemoteBipedRouteLogged = ArmorSkinRemoteBipedRouteLogged or {}
+ArmorSkinRemoteBipedFailureLogged = ArmorSkinRemoteBipedFailureLogged or {}
+ArmorSkinRemoteAttachedAuditLogged = ArmorSkinRemoteAttachedAuditLogged or {}
+-- RC3_34: network observers do not expose the rendered Spartan through the
+-- replicated Pawn component tree. Cache only the two *specific* presentation
+-- classes involved in Spartan rendering; never scan generic mesh components.
+ArmorSkinBipedClass = ArmorSkinBipedClass
+ArmorSkinBipedInstanceCache = ArmorSkinBipedInstanceCache or {}
+ArmorSkinBipedInstanceSeen = ArmorSkinBipedInstanceSeen or {}
+ArmorSkinBipedExactScanGeneration = ArmorSkinBipedExactScanGeneration or -1
+-- RC3_35: exact BP_SpartansBipedActor instances are the useful remote render
+-- containers.  They are not necessarily outered/attached to the replicated
+-- BP_MeteoritePawn on an observing peer, so keep an explicit pawn->biped map.
+ArmorSkinBipedAssignmentByPawnKey = ArmorSkinBipedAssignmentByPawnKey or {}
+ArmorSkinBipedAssignmentMetaByPawnKey = ArmorSkinBipedAssignmentMetaByPawnKey or {}
+-- V15: string-only identity memory survives assignment invalidation safely.
+-- Never retain extra UObject refs here; keys are used only to recognize a remote
+-- player whose presentation biped did NOT change while the other player respawned.
+ArmorSkinLastKnownBipedKeyByPlayerId = ArmorSkinLastKnownBipedKeyByPlayerId or {}
+ArmorSkinBipedAssignmentAuditLogged = ArmorSkinBipedAssignmentAuditLogged or {}
+ArmorSkinBipedAnchorPendingLogged = ArmorSkinBipedAnchorPendingLogged or {}
+-- RC3_39: multi-remote identity helpers. These are bounded to the already
+-- discovered BP_SpartansBipedActor_C objects; never generic mesh scans.
+ArmorSkinBipedMotionBaseline = ArmorSkinBipedMotionBaseline or {}
+ArmorSkinBipedOrdinalAuditLogged = ArmorSkinBipedOrdinalAuditLogged or {}
+-- RC3_42: safe multi-remote identity. PlayerId remains an opaque replicated
+-- identity token. P1/P2 is carried explicitly as origin-slot metadata in armor
+-- protocol 2, so join order and numeric PlayerId assignment are irrelevant.
+-- The only inferred presentation rule is the repeatedly observed two-player
+-- REMOTE split pair: its generated biped instance order is reversed relative to
+-- the originating local P1/P2 slot order. No movement/global mesh scan is used.
+ArmorSkinPlayerIdOrdinalHint = ArmorSkinPlayerIdOrdinalHint
+ArmorSkinOrdinalHintSentByController = ArmorSkinOrdinalHintSentByController or {}
+ArmorSkinOrdinalAuditLogged = ArmorSkinOrdinalAuditLogged or {}
+ArmorSkinTopologySentinelPlayerId = 2147483646
+ArmorSkinTopologySameCode = 100
+ArmorSkinTopologyReverseCode = 101
+ArmorSkinCVWSkeletalClass = ArmorSkinCVWSkeletalClass
+ArmorSkinCVWSkeletalCache = ArmorSkinCVWSkeletalCache or {}
+ArmorSkinCVWSkeletalSeen = ArmorSkinCVWSkeletalSeen or {}
+ArmorSkinCVWExactScanGeneration = ArmorSkinCVWExactScanGeneration or -1
+ArmorSkinCVWConstructionListenerReady = ArmorSkinCVWConstructionListenerReady or false
+ArmorSkinChiefPresentationClasses = ArmorSkinChiefPresentationClasses or {}
+ArmorSkinChiefPresentationClassSeen = ArmorSkinChiefPresentationClassSeen or {}
+ArmorSkinSyncReflectionAuditLogged = ArmorSkinSyncReflectionAuditLogged or {}
+ArmorSkinBipedConstructionListenerReady = ArmorSkinBipedConstructionListenerReady or false
+ArmorSkinDefaultCatalogIndex = ArmorSkinDefaultCatalogIndex
+
+function ArmorSkinContainsCI(Haystack, Needle)
+    return string.find(string.lower(tostring(Haystack or "")), string.lower(tostring(Needle or "")), 1, true) ~= nil
+end
+
+function ArmorSkinPlayerIdFromController(Controller)
+    Controller = Unwrap(Controller)
+    if not IsValidObject(Controller) or not IsValidObject(Controller.PlayerState) then return nil end
+    local Value = nil
+    pcall(function() Value = Unwrap(Controller.PlayerState.PlayerId) end)
+    return tonumber(Value)
+end
+
+function ArmorSkinPlayerIdFromPawn(Pawn)
+    Pawn = Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return nil end
+    local State = nil
+    pcall(function() State = Unwrap(Pawn.PlayerState) end)
+    if IsValidObject(State) then
+        local Value = nil
+        pcall(function() Value = Unwrap(State.PlayerId) end)
+        if tonumber(Value) ~= nil then return tonumber(Value) end
+    end
+    local Controller = nil
+    pcall(function() Controller = Unwrap(Pawn.Controller) end)
+    if not IsValidObject(Controller) then pcall(function() Controller = Unwrap(Pawn:GetController()) end) end
+    return ArmorSkinPlayerIdFromController(Controller)
+end
+
+function ArmorSkinTargetKey(PlayerId, PlayerIndex)
+    local NumericId = tonumber(PlayerId)
+    if NumericId ~= nil then return "P:" .. tostring(math.floor(NumericId)) end
+    return "LOCAL:" .. tostring(tonumber(PlayerIndex) or 0)
+end
+
+-- UE4SS may materialize a fresh Lua wrapper for the same UObject on separate
+-- lookups. Lua table/userdata identity therefore cannot be used to decide that
+-- a pawn or biped was replaced. Full UObject names include the actor instance
+-- path and remain stable for the lifetime of that instance.
+function ArmorSkinObjectKey(Object)
+    Object = Unwrap(Object)
+    if not IsValidObject(Object) then return nil end
+    local Name = SafeFullName(Object)
+    if Name ~= nil and tostring(Name) ~= "" then return tostring(Name) end
+    return nil
+end
+
+function ArmorSkinGetPawnFromController(Controller)
+    Controller = Unwrap(Controller)
+    if not IsValidObject(Controller) then return nil end
+    local Pawn = nil
+    pcall(function() Pawn = Unwrap(Controller.Pawn) end)
+    if not IsValidObject(Pawn) then pcall(function() Pawn = Unwrap(Controller:GetPawn()) end) end
+    return IsValidObject(Pawn) and Pawn or nil
+end
+
+function ArmorSkinPlayerIdFromState(State)
+    State = Unwrap(State)
+    if not IsValidObject(State) then return nil end
+    local Value = nil
+    pcall(function() Value = Unwrap(State.PlayerId) end)
+    return tonumber(Value)
+end
+
+function ArmorSkinPawnFromPlayerState(State)
+    State = Unwrap(State)
+    if not IsValidObject(State) then return nil end
+    local Pawn = nil
+    -- APlayerState::GetPawn is replicated-client friendly in UE5. If the
+    -- reflected call is unavailable on a build, PawnPrivate/property fallbacks
+    -- are harmless and remain bounded to the already-matched PlayerState.
+    pcall(function() Pawn = Unwrap(State:GetPawn()) end)
+    if not IsValidObject(Pawn) then pcall(function() Pawn = Unwrap(State.PawnPrivate) end) end
+    if not IsValidObject(Pawn) then pcall(function() Pawn = Unwrap(State.Pawn) end) end
+    return IsValidObject(Pawn) and Pawn or nil
+end
+
+function ArmorSkinGameState()
+    local GameState = nil
+    pcall(function()
+        local World = UEHelpers.GetWorldContextObject()
+        if IsValidObject(World) then GameState = Unwrap(World.GameState) end
+    end)
+    if not IsValidObject(GameState) then
+        pcall(function()
+            GameState = Unwrap(GetGameplayStatics():GetGameState(UEHelpers.GetWorldContextObject()))
+        end)
+    end
+    return IsValidObject(GameState) and GameState or nil
+end
+
+function ArmorSkinResolvePawnByPlayerId(TargetPlayerId)
+    TargetPlayerId = tonumber(TargetPlayerId)
+    if TargetPlayerId == nil then return nil, nil, "invalid-player-id" end
+
+    -- Local players first: cheapest and exact for standalone/listen-host and
+    -- for the originating network client receiving its own relayed state.
+    for PlayerIndex = 1, 2 do
+        local Controller = GetPlayer(PlayerIndex)
+        if IsValidObject(Controller) and ArmorSkinPlayerIdFromController(Controller) == TargetPlayerId then
+            local Pawn = ArmorSkinGetPawnFromController(Controller)
+            if IsValidObject(Pawn) then
+                return Pawn, Controller, string.format("local-controller-P%d", PlayerIndex)
+            end
+        end
+    end
+
+    -- RC3_29: on an owning network client, remote PlayerControllers normally do
+    -- not exist locally. PlayerStates do: GameState.PlayerArray is replicated to
+    -- every peer and PlayerState:GetPawn()/PawnPrivate gives us the corresponding
+    -- remote pawn. This is the player equivalent of the stable cross-peer
+    -- identity lookup already used by Warthog/Scorpion network paint.
+    local GameState = ArmorSkinGameState()
+    if IsValidObject(GameState) then
+        local PlayerArray = nil
+        pcall(function() PlayerArray = GameState.PlayerArray end)
+        for _, RawState in ipairs(ArrayValues(PlayerArray)) do
+            local State = Unwrap(RawState)
+            if IsValidObject(State) and ArmorSkinPlayerIdFromState(State) == TargetPlayerId then
+                local Pawn = ArmorSkinPawnFromPlayerState(State)
+                if IsValidObject(Pawn) then
+                    local Controller = nil
+                    pcall(function() Controller = Unwrap(Pawn.Controller) end)
+                    if not IsValidObject(Controller) then pcall(function() Controller = Unwrap(Pawn:GetController()) end) end
+                    return Pawn, IsValidObject(Controller) and Controller or nil, "GameState.PlayerArray/PlayerState.GetPawn"
+                end
+
+                -- Some builds expose the PlayerState on the pawn but not GetPawn
+                -- to Lua. Match the already-identified PlayerState object directly
+                -- before falling back to PlayerId reads from every pawn.
+                local StateKey = ArmorSkinObjectKey(State)
+                if StateKey ~= nil then
+                    local Pawns = nil
+                    pcall(function() Pawns = FindAllOf("BP_MeteoritePawn_C") end)
+                    for _, RawPawn in ipairs(Pawns or {}) do
+                        local Candidate = Unwrap(RawPawn)
+                        if IsValidObject(Candidate) then
+                            local CandidateState = nil
+                            pcall(function() CandidateState = Unwrap(Candidate.PlayerState) end)
+                            if IsValidObject(CandidateState) and ArmorSkinObjectKey(CandidateState) == StateKey then
+                                local Controller = nil
+                                pcall(function() Controller = Unwrap(Candidate.Controller) end)
+                                return Candidate, IsValidObject(Controller) and Controller or nil,
+                                    "GameState.PlayerArray/PlayerState-object-match"
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Existing exact-pawn fallback retained for builds where Pawn.PlayerState is
+    -- directly exposed and no GameState helper is needed.
+    local Anchor = GetPlayer(1)
+    local LevelPrefix = ""
+    if IsValidObject(Anchor) then
+        LevelPrefix = string.match(SafeFullName(Anchor) or "", "^(.-:PersistentLevel)") or ""
+    end
+
+    local Pawns = nil
+    pcall(function() Pawns = FindAllOf("BP_MeteoritePawn_C") end)
+    for _, RawPawn in ipairs(Pawns or {}) do
+        local Pawn = Unwrap(RawPawn)
+        if IsValidObject(Pawn) then
+            local Name = SafeFullName(Pawn) or ""
+            local SameLevel = LevelPrefix == "" or string.find(Name, LevelPrefix, 1, true) ~= nil
+            if SameLevel and not string.find(Name, "Default__", 1, true) and ArmorSkinPlayerIdFromPawn(Pawn) == TargetPlayerId then
+                local Controller = nil
+                pcall(function() Controller = Unwrap(Pawn.Controller) end)
+                if not IsValidObject(Controller) then pcall(function() Controller = Unwrap(Pawn:GetController()) end) end
+                return Pawn, IsValidObject(Controller) and Controller or nil, "BP_MeteoritePawn PlayerId scan"
+            end
+        end
+    end
+    return nil, nil, "unresolved"
+end
+
+function ArmorSkinSameObject(A, B)
+    A, B = Unwrap(A), Unwrap(B)
+    if not IsValidObject(A) or not IsValidObject(B) then return false end
+    local AK, BK = ArmorSkinObjectKey(A), ArmorSkinObjectKey(B)
+    if AK ~= nil and BK ~= nil then return AK == BK end
+    return tostring(SafeFullName(A) or "") == tostring(SafeFullName(B) or "")
+end
+
+function ArmorSkinObjectChainReachesPawn(Object, Pawn)
+    Object, Pawn = Unwrap(Object), Unwrap(Pawn)
+    if not IsValidObject(Object) or not IsValidObject(Pawn) then return false, "invalid" end
+    local Queue = {{Object=Object, Depth=0, Route="biped"}}
+    local Seen, Q = {}, 1
+    while Q <= #Queue and Q <= 64 do
+        local Item = Queue[Q]; Q = Q + 1
+        local Current = Unwrap(Item.Object)
+        if IsValidObject(Current) then
+            if ArmorSkinSameObject(Current, Pawn) then return true, Item.Route end
+            local Key = ArmorSkinObjectKey(Current) or tostring(SafeFullName(Current) or "")
+            if Key ~= "" and not Seen[Key] then
+                Seen[Key] = true
+                if (tonumber(Item.Depth) or 0) < 5 then
+                    local function Add(Value, Edge)
+                        Value = Unwrap(Value)
+                        if IsValidObject(Value) then
+                            Queue[#Queue + 1] = {Object=Value, Depth=(tonumber(Item.Depth) or 0)+1,
+                                Route=tostring(Item.Route) .. "->" .. tostring(Edge)}
+                        end
+                    end
+                    local V = nil
+                    pcall(function() V = Current:GetOwner() end); Add(V, "GetOwner")
+                    V = nil; pcall(function() V = Current.Owner end); Add(V, "Owner")
+                    V = nil; pcall(function() V = Current:GetOuter() end); Add(V, "GetOuter")
+                    V = nil; pcall(function() V = Current:GetAttachParentActor() end); Add(V, "GetAttachParentActor")
+                    V = nil; pcall(function() V = Current:GetAttachParent() end); Add(V, "GetAttachParent")
+                    V = nil; pcall(function() V = Current:GetParentActor() end); Add(V, "GetParentActor")
+                    V = nil; pcall(function() V = Current:GetParentComponent() end); Add(V, "GetParentComponent")
+                    V = nil; pcall(function() V = Current.AttachParent end); Add(V, "AttachParent")
+                    V = nil; pcall(function() V = Current.ParentComponent end); Add(V, "ParentComponent")
+                    V = nil; pcall(function() V = Current.RootComponent end); Add(V, "RootComponent")
+                    V = nil; pcall(function() V = Current:GetInstigator() end); Add(V, "GetInstigator")
+                    V = nil; pcall(function() V = Current.Instigator end); Add(V, "Instigator")
+                end
+            end
+        end
+    end
+    return false, "unlinked"
+end
+
+-- RC3_34 remote presentation discovery ---------------------------------------
+-- Warthog/Scorpion have a replicated actor with a stable Blam identifier and
+-- reachable material components. The Spartan presentation is different: the
+-- replicated BP_MeteoritePawn can be a simulation shell while the visible body
+-- is generated by the Blam mesh-synchronization layer. The helpers below cache
+-- only BP_SpartansBipedActor_C and CVW BPC_SkeletalMesh_C instances and map
+-- those small candidate sets to PlayerState pawns. This avoids RC3_32's unsafe
+-- FindAllOf(SkeletalMeshComponent/StaticMeshComponent) world scan entirely.
+function ArmorSkinCacheBipedInstance(Biped, Source)
+    Biped = Unwrap(Biped)
+    if not IsValidObject(Biped) then return false end
+    local Full = tostring(SafeFullName(Biped) or "")
+    if not ArmorSkinContainsCI(Full, "BP_SpartansBipedActor_C") or string.find(Full, "Default__", 1, true) then return false end
+    local Key = ArmorSkinObjectKey(Biped) or Full
+    if Key == "" then return false end
+    if not ArmorSkinBipedInstanceSeen[Key] then
+        ArmorSkinBipedInstanceSeen[Key] = true
+        if #ArmorSkinBipedInstanceCache < 96 then ArmorSkinBipedInstanceCache[#ArmorSkinBipedInstanceCache+1] = Biped end
+    end
+    if not IsValidObject(ArmorSkinBipedClass) then
+        local C = nil; pcall(function() C = Unwrap(Biped:GetClass()) end)
+        if IsValidObject(C) then
+            ArmorSkinBipedClass = C
+            Log("ARMORSKIN exact biped UClass cached class=%s source=%s", tostring(SafeFullName(C) or C), tostring(Source or "runtime"))
+        end
+    end
+    return true
+end
+
+function ArmorSkinEnsureBipedClass()
+    if IsValidObject(ArmorSkinBipedClass) then return ArmorSkinBipedClass end
+    local C = nil
+    -- Live RC3_34 logs show the runtime class is the SynchronizationTestContent
+    -- prototype class, not /Game/Blueprints/BP_SpartansBipedActor.
+    pcall(function() C = Unwrap(StaticFindObject("/Game/_Prototypes/SynchronizationTestContent/TestActor/BP_SpartansBipedActor.BP_SpartansBipedActor_C")) end)
+    if not IsValidObject(C) then
+        pcall(function() C = Unwrap(StaticFindObject("/Game/Blueprints/BP_SpartansBipedActor.BP_SpartansBipedActor_C")) end)
+    end
+    if IsValidObject(C) then ArmorSkinBipedClass = C; return C end
+    for PlayerIndex=1,2 do
+        local Pawn = ArmorSkinGetPawnFromController(GetPlayer(PlayerIndex))
+        if IsValidObject(Pawn) then
+            local Children=nil; pcall(function() Children=Pawn.Children end)
+            for _,Raw in ipairs(ArrayValues(Children)) do
+                local O=Unwrap(Raw)
+                if IsValidObject(O) and ArmorSkinContainsCI(SafeFullName(O), "BP_SpartansBipedActor_C") then
+                    ArmorSkinCacheBipedInstance(O, "local Pawn.Children class seed")
+                    if IsValidObject(ArmorSkinBipedClass) then return ArmorSkinBipedClass end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function ArmorSkinAllKnownPlayerPawns()
+    local Out, Seen = {}, {}
+    local function Add(P)
+        P=Unwrap(P); if not IsValidObject(P) then return end
+        local K=ArmorSkinObjectKey(P) or tostring(SafeFullName(P) or "")
+        if K ~= "" and not Seen[K] then Seen[K]=true; Out[#Out+1]=P end
+    end
+    for I=1,2 do Add(ArmorSkinGetPawnFromController(GetPlayer(I))) end
+    local GS=ArmorSkinGameState()
+    if IsValidObject(GS) then
+        local Arr=nil; pcall(function() Arr=GS.PlayerArray end)
+        for I,RawState in ipairs(ArrayValues(Arr)) do
+            if I > 16 then break end
+            Add(ArmorSkinPawnFromPlayerState(Unwrap(RawState)))
+        end
+    end
+    return Out
+end
+
+function ArmorSkinSpatialCandidateMatchesPawn(Candidate, Pawn)
+    Candidate, Pawn = Unwrap(Candidate), Unwrap(Pawn)
+    if not IsValidObject(Candidate) or not IsValidObject(Pawn) then return false, nil, "invalid" end
+    local CX,CY,CZ=ScorpionObjectWorldLocation(Candidate)
+    local PX,PY,PZ=ScorpionObjectWorldLocation(Pawn)
+    if CX==nil or PX==nil then return false,nil,"no-location" end
+    local dx,dy,dz=CX-PX,CY-PY,CZ-PZ
+    local targetD2=dx*dx+dy*dy+dz*dz
+    -- A biped/CVW component should be at or very close to its simulation pawn.
+    -- 500 uu is intentionally generous for origin/bone offsets, but the nearest
+    -- pawn test below prevents assigning a presentation to the wrong player.
+    if targetD2 > 500*500 then return false, math.sqrt(targetD2), "too-far" end
+    local targetKey=ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+    local nearestKey,nearestD2,secondD2=nil,nil,nil
+    for _,P in ipairs(ArmorSkinAllKnownPlayerPawns()) do
+        local X,Y,Z=ScorpionObjectWorldLocation(P)
+        if X~=nil then
+            local a,b,c=CX-X,CY-Y,CZ-Z
+            local d2=a*a+b*b+c*c
+            if nearestD2==nil or d2 < nearestD2 then
+                secondD2=nearestD2; nearestD2=d2; nearestKey=ArmorSkinObjectKey(P) or tostring(SafeFullName(P) or "")
+            elseif secondD2==nil or d2 < secondD2 then secondD2=d2 end
+        end
+    end
+    if nearestKey ~= targetKey then return false, math.sqrt(targetD2), "nearest-other-pawn" end
+    -- Exact/co-located origins are decisive. Otherwise require useful separation
+    -- from the runner-up if another pawn happens to be standing nearby.
+    if targetD2 <= 35*35 then return true, math.sqrt(targetD2), "co-located" end
+    if secondD2 ~= nil and secondD2 - targetD2 < 75*75 then
+        return false, math.sqrt(targetD2), "ambiguous-nearest"
+    end
+    return true, math.sqrt(targetD2), "unique-nearest"
+end
+
+function ArmorSkinFNameString(Value)
+    Value = Unwrap(Value)
+    if Value == nil then return "" end
+    local S = nil
+    pcall(function() S = Value:ToString() end)
+    if S ~= nil and tostring(S) ~= "" then return tostring(S) end
+    return tostring(Value or "")
+end
+
+function ArmorSkinClassShortName(ClassObject, Fallback)
+    ClassObject = Unwrap(ClassObject)
+    if IsValidObject(ClassObject) then
+        local N = nil
+        pcall(function() N = ClassObject:GetFName():ToString() end)
+        if N ~= nil and tostring(N) ~= "" then return tostring(N) end
+    end
+    local F = tostring(Fallback or "")
+    if F ~= "" and string.find(F, "FNameUserdata", 1, true) == nil then return F end
+    return ""
+end
+
+function ArmorSkinTargetedFindObjects(ClassObject, ShortClassName, Limit)
+    local Out, Seen = {}, {}
+    Limit=tonumber(Limit) or 128
+    local function AddList(List)
+        for _,Raw in ipairs(List or {}) do
+            if #Out >= Limit then break end
+            local O=Unwrap(Raw)
+            if IsValidObject(O) then
+                local K=ArmorSkinObjectKey(O) or tostring(SafeFullName(O) or "")
+                if K ~= "" and not Seen[K] and not string.find(K,"Default__",1,true) then
+                    Seen[K]=true; Out[#Out+1]=O
+                end
+            end
+        end
+    end
+
+    local ClassName = ArmorSkinClassShortName(ClassObject, ShortClassName)
+    if ClassName == "" then return Out end
+
+    -- Correct UE4SS signature: FindObjects(count, short-class-name, object-name,
+    -- required/banned flags, exactClass). Do NOT pass UClass as the class-name
+    -- argument; RC3_34 did that and its result counts were not trustworthy.
+    local L=nil
+    pcall(function() L=FindObjects(Limit, ClassName, nil, 0, 0, true) end)
+    AddList(L)
+    if #Out == 0 then
+        L=nil; pcall(function() L=FindAllOf(ClassName) end); AddList(L)
+    end
+    return Out
+end
+
+function ArmorSkinSeedExactBipedCache()
+    if tonumber(ArmorSkinBipedExactScanGeneration) == tonumber(WarthogColorRuntimeGeneration) then return end
+    ArmorSkinBipedExactScanGeneration = tonumber(WarthogColorRuntimeGeneration) or 0
+    local C=ArmorSkinEnsureBipedClass()
+    local Found=ArmorSkinTargetedFindObjects(C,"BP_SpartansBipedActor_C",64)
+    for _,O in ipairs(Found) do ArmorSkinCacheBipedInstance(O,"exact-class seed") end
+    Log("ARMORSKIN exact biped class seed generation=%d found=%d cached=%d",
+        tonumber(WarthogColorRuntimeGeneration) or 0,#Found,#ArmorSkinBipedInstanceCache)
+end
+
+-- RC3_35 exact Spartan presentation assignment -------------------------------
+-- The live RC3_34 run proved there are exactly three instances of the runtime
+-- BP_SpartansBipedActor class in a 3-player session, even though the remote
+-- BP_MeteoritePawn exposes no biped in Children/Components.  Treat those biped
+-- actors as the render containers and map them explicitly to replicated pawns.
+
+function ArmorSkinWorldObject(Object)
+    Object=Unwrap(Object); if not IsValidObject(Object) then return nil end
+    local W=nil
+    pcall(function() W=Unwrap(Object:GetWorld()) end)
+    if not IsValidObject(W) then pcall(function() W=Unwrap(Object.World) end) end
+    return IsValidObject(W) and W or nil
+end
+
+function ArmorSkinSharesRuntimeWorld(A,B)
+    local WA,WB=ArmorSkinWorldObject(A),ArmorSkinWorldObject(B)
+    if IsValidObject(WA) and IsValidObject(WB) then return ArmorSkinSameObject(WA,WB) end
+    -- Missing reflected GetWorld must not reject a candidate. Identity and
+    -- component-position checks below are still bounded to <=96 biped actors.
+    return true
+end
+
+function ArmorSkinDirectBipedChild(Pawn)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return nil end
+    local Children=nil; pcall(function() Children=Pawn.Children end)
+    for _,Raw in ipairs(ArrayValues(Children)) do
+        local B=Unwrap(Raw)
+        if IsValidObject(B) and ArmorSkinContainsCI(SafeFullName(B),"BP_SpartansBipedActor_C") then
+            ArmorSkinCacheBipedInstance(B,"direct child mapping")
+            return B
+        end
+    end
+    return nil
+end
+
+function ArmorSkinBipedChiefSlotCount(Biped)
+    Biped=Unwrap(Biped); if not IsValidObject(Biped) then return 0 end
+    local N=0
+    for I,C in ipairs(WarthogGetActorComponents(Biped) or {}) do
+        if I>96 then break end
+        C=Unwrap(C)
+        if IsValidObject(C) and not ArmorSkinObjectLooksLikeWeapon(C) then
+            for _,S in ipairs(ArmorSkinGetMaterialSlots(C)) do
+                if ArmorSkinMaterialLooksLikeChief(S.Material) then N=N+1 end
+            end
+        end
+    end
+    return N
+end
+
+function ArmorSkinBipedDistanceToPawn(Biped,Pawn)
+    Biped,Pawn=Unwrap(Biped),Unwrap(Pawn)
+    if not IsValidObject(Biped) or not IsValidObject(Pawn) then return nil,"invalid" end
+    local PX,PY,PZ=ScorpionObjectWorldLocation(Pawn)
+    if PX==nil then return nil,"pawn-no-location" end
+
+    local BestChief,BestAny=nil,nil
+    local Components=WarthogGetActorComponents(Biped) or {}
+    for I,Raw in ipairs(Components) do
+        if I>96 then break end
+        local C=Unwrap(Raw)
+        if IsValidObject(C) and not ArmorSkinObjectLooksLikeWeapon(C) then
+            local Slots=ArmorSkinGetMaterialSlots(C)
+            if #Slots>0 then
+                local CX,CY,CZ=ScorpionObjectWorldLocation(C)
+                if CX~=nil then
+                    local dx,dy,dz=CX-PX,CY-PY,CZ-PZ
+                    local D=math.sqrt(dx*dx+dy*dy+dz*dz)
+                    if BestAny==nil or D<BestAny then BestAny=D end
+                    local Chief=false
+                    for _,S in ipairs(Slots) do
+                        if ArmorSkinMaterialLooksLikeChief(S.Material) then Chief=true; break end
+                    end
+                    if Chief and (BestChief==nil or D<BestChief) then BestChief=D end
+                end
+            end
+        end
+    end
+    if BestChief~=nil then return BestChief,"chief-component" end
+    if BestAny~=nil then return BestAny,"material-component" end
+    local BX,BY,BZ=ScorpionObjectWorldLocation(Biped)
+    if BX~=nil then
+        local dx,dy,dz=BX-PX,BY-PY,BZ-PZ
+        return math.sqrt(dx*dx+dy*dy+dz*dz),"actor"
+    end
+    return nil,"no-location"
+end
+
+
+-- RC3_37: A30 proved that the generated Chief mesh components can live in a
+-- presentation coordinate space thousands of units away from BP_MeteoritePawn.
+-- For multi-remote assignment, first try the biped actor transform itself, then
+-- calibrate the presentation-space translation from identity-safe local anchors.
+function ArmorSkinBipedActorDistanceToPawn(Biped,Pawn)
+    Biped,Pawn=Unwrap(Biped),Unwrap(Pawn)
+    if not IsValidObject(Biped) or not IsValidObject(Pawn) then return nil end
+    local BX,BY,BZ=ScorpionObjectWorldLocation(Biped)
+    local PX,PY,PZ=ScorpionObjectWorldLocation(Pawn)
+    if BX==nil or PX==nil then return nil end
+    local X,Y,Z=BX-PX,BY-PY,BZ-PZ
+    return math.sqrt(X*X+Y*Y+Z*Z)
+end
+
+function ArmorSkinBipedChiefReferenceLocation(Biped)
+    Biped=Unwrap(Biped); if not IsValidObject(Biped) then return nil,nil,nil,0 end
+    local SX,SY,SZ,N=0,0,0,0
+    for I,Raw in ipairs(WarthogGetActorComponents(Biped) or {}) do
+        if I>96 then break end
+        local C=Unwrap(Raw)
+        if IsValidObject(C) and not ArmorSkinObjectLooksLikeWeapon(C) then
+            local Chief=false
+            for _,S in ipairs(ArmorSkinGetMaterialSlots(C)) do
+                if ArmorSkinMaterialLooksLikeChief(S.Material) then Chief=true; break end
+            end
+            if Chief then
+                local X,Y,Z=ScorpionObjectWorldLocation(C)
+                if X~=nil then SX=SX+X; SY=SY+Y; SZ=SZ+Z; N=N+1 end
+            end
+        end
+    end
+    if N>0 then return SX/N,SY/N,SZ/N,N end
+    local X,Y,Z=ScorpionObjectWorldLocation(Biped)
+    if X~=nil then return X,Y,Z,0 end
+    return nil,nil,nil,0
+end
+
+function ArmorSkinPresentationOffsetFromLocalAnchors(Records,Assignments)
+    local Offsets={}
+    for _,R in ipairs(Records or {}) do
+        if R.LocalIndex~=nil then
+            local B=Unwrap((Assignments or {})[R.Key])
+            if IsValidObject(B) then
+                local BX,BY,BZ=ArmorSkinBipedChiefReferenceLocation(B)
+                local PX,PY,PZ=ScorpionObjectWorldLocation(R.Pawn)
+                if BX~=nil and PX~=nil then Offsets[#Offsets+1]={X=BX-PX,Y=BY-PY,Z=BZ-PZ} end
+            end
+        end
+    end
+    if #Offsets==0 then return nil,nil,nil,0,nil end
+    local SX,SY,SZ=0,0,0
+    for _,O in ipairs(Offsets) do SX=SX+O.X; SY=SY+O.Y; SZ=SZ+O.Z end
+    local AX,AY,AZ=SX/#Offsets,SY/#Offsets,SZ/#Offsets
+    local MaxSpread=0
+    for _,O in ipairs(Offsets) do
+        local X,Y,Z=O.X-AX,O.Y-AY,O.Z-AZ
+        local D=math.sqrt(X*X+Y*Y+Z*Z)
+        if D>MaxSpread then MaxSpread=D end
+    end
+    -- Multiple local anchors must agree. A single local anchor is still an
+    -- identity-safe calibration source because its Pawn.Children relation is exact.
+    if #Offsets>1 and MaxSpread>1000.0 then return nil,nil,nil,#Offsets,MaxSpread end
+    return AX,AY,AZ,#Offsets,MaxSpread
+end
+
+function ArmorSkinBipedCalibratedDistanceToPawn(Biped,Pawn,OX,OY,OZ)
+    if OX==nil then return nil end
+    local BX,BY,BZ=ArmorSkinBipedChiefReferenceLocation(Biped)
+    local PX,PY,PZ=ScorpionObjectWorldLocation(Pawn)
+    if BX==nil or PX==nil then return nil end
+    local X,Y,Z=BX-(PX+OX),BY-(PY+OY),BZ-(PZ+OZ)
+    return math.sqrt(X*X+Y*Y+Z*Z)
+end
+
+
+-- RC3_46: immediate deterministic remote identity from an exact LOCAL anchor.
+-- BP_MeteoritePawn and the generated Chief render body can live in coordinate
+-- spaces separated by a large translation.  A local Pawn.Children relation is
+-- exact identity, so its Chief-reference offset calibrates those spaces.  We
+-- then solve the remaining remote pawn<->biped assignment one-to-one by the
+-- calibrated residual.  No PlayerId numeric ordering, instance suffix, network
+-- role, or construction order participates in the decision.
+function ArmorSkinTryCalibratedRemoteAssignment(Records,NewAssign,RemotePending,Available,Assign,Compact)
+    if #RemotePending<2 or #Available~=#RemotePending or #RemotePending>4 then return false end
+    local OX,OY,OZ,AnchorCount,AnchorSpread=ArmorSkinPresentationOffsetFromLocalAnchors(Records,NewAssign)
+    if OX==nil or (tonumber(AnchorCount) or 0)<1 then return false end
+
+    local Cost={}
+    for I,R in ipairs(RemotePending) do
+        Cost[I]={}
+        for J,A in ipairs(Available) do
+            local D=ArmorSkinBipedCalibratedDistanceToPawn(A.Biped,R.Pawn,OX,OY,OZ)
+            if D==nil then return false end
+            Cost[I][J]=D
+        end
+    end
+
+    local Best,Second=nil,nil
+    local Used,Choice={},{}
+    local function Evaluate()
+        local SumSq,MaxErr=0,0
+        local Residual={}
+        for I=1,#RemotePending do
+            local D=Cost[I][Choice[I]]
+            Residual[I]=D
+            SumSq=SumSq+D*D
+            if D>MaxErr then MaxErr=D end
+        end
+        local C={Score=math.sqrt(SumSq/#RemotePending),MaxErr=MaxErr,Choice={},Residual=Residual}
+        for I=1,#RemotePending do C.Choice[I]=Choice[I] end
+        if Best==nil or C.Score<Best.Score then Second=Best; Best=C
+        elseif Second==nil or C.Score<Second.Score then Second=C end
+    end
+    local function Recurse(I)
+        if I>#RemotePending then Evaluate(); return end
+        for J=1,#Available do
+            if not Used[J] then
+                Used[J]=true; Choice[I]=J; Recurse(I+1); Used[J]=nil
+            end
+        end
+    end
+    Recurse(1)
+    if Best==nil then return false end
+
+    local SecondScore=Second and Second.Score or nil
+    local Margin=SecondScore and (SecondScore-Best.Score) or 999999
+    local Ratio=(SecondScore and Best.Score>0.001) and (SecondScore/Best.Score) or 999999
+
+    -- Keep this conservative.  Correct pairs should collapse close to the
+    -- local-anchor translation; wrong cross-pairs differ by inter-player
+    -- spacing.  If the players overlap so tightly that the two permutations
+    -- are not distinguishable, WAIT instead of painting the wrong Spartan.
+    local Decisive = Best.MaxErr<=600.0 and (Second==nil or Margin>=40.0 or Ratio>=1.35)
+
+    local MatrixParts={}
+    for I,R in ipairs(RemotePending) do
+        local Row={}
+        for J,A in ipairs(Available) do
+            Row[#Row+1]=string.format("%s=%.1f",tostring(string.match(A.Key or "","BP_SpartansBipedActor_C_%d+") or J),Cost[I][J])
+        end
+        MatrixParts[#MatrixParts+1]=string.format("pid%s[P%s]:%s",tostring(R.PlayerId or "?"),
+            tostring(ArmorSkinNetworkOriginSlotForPlayerId(R.PlayerId) or "?"),table.concat(Row,","))
+    end
+
+    if not Decisive then
+        local K="calibrated-wait:"..tostring(WarthogColorRuntimeGeneration or 0)
+        if not ArmorSkinBipedOrdinalAuditLogged[K] then
+            ArmorSkinBipedOrdinalAuditLogged[K]=true
+            Log("ARMORSKIN calibrated identity WAIT anchors=%d spread=%s best=%.1f maxErr=%.1f second=%s margin=%.1f ratio=%.2f matrix=%s",
+                tonumber(AnchorCount) or 0,tostring(AnchorSpread or "-"),Best.Score,Best.MaxErr,
+                SecondScore and string.format("%.1f",SecondScore) or "-",Margin,Ratio,table.concat(MatrixParts," | "))
+        end
+        return false
+    end
+
+    local Mapping={}
+    for I,R in ipairs(RemotePending) do
+        local A=Available[Best.Choice[I]]
+        Mapping[#Mapping+1]=string.format("%s[P%s]->%s(err=%.1f)",tostring(R.PlayerId or "?"),
+            tostring(ArmorSkinNetworkOriginSlotForPlayerId(R.PlayerId) or "?"),
+            tostring(string.match(A.Key or "","BP_SpartansBipedActor_C_%d+") or A.Key),Best.Residual[I] or -1)
+        Assign(R,A,"local-anchor-calibrated",Best.Residual[I],"local-Pawn.Children/presentation-offset")
+    end
+    Compact()
+    Log("ARMORSKIN calibrated identity mapping anchors=%d spread=%s rms=%.1f maxErr=%.1f second=%s margin=%.1f ratio=%.2f map=%s matrix=%s",
+        tonumber(AnchorCount) or 0,tostring(AnchorSpread or "-"),Best.Score,Best.MaxErr,
+        SecondScore and string.format("%.1f",SecondScore) or "-",Margin,Ratio,table.concat(Mapping," | "),table.concat(MatrixParts," | "))
+    return #Mapping>0
+end
+
+function ArmorSkinAllKnownPlayerPawnRecords()
+    local Out,ByKey={},{ }
+    local function Add(P,Pid,LocalIndex)
+        P=Unwrap(P); if not IsValidObject(P) then return end
+        local K=ArmorSkinObjectKey(P) or tostring(SafeFullName(P) or "")
+        if K=="" then return end
+        local R=ByKey[K]
+        if not R then
+            R={Pawn=P,Key=K,PlayerId=tonumber(Pid) or ArmorSkinPlayerIdFromPawn(P),LocalIndex=LocalIndex}
+            ByKey[K]=R; Out[#Out+1]=R
+        else
+            if R.PlayerId==nil then R.PlayerId=tonumber(Pid) or ArmorSkinPlayerIdFromPawn(P) end
+            if R.LocalIndex==nil and LocalIndex~=nil then R.LocalIndex=LocalIndex end
+        end
+    end
+    for I=1,2 do
+        local C=GetPlayer(I); local P=ArmorSkinGetPawnFromController(C)
+        Add(P,ArmorSkinPlayerIdFromController(C),IsValidObject(P) and I or nil)
+    end
+    local GS=ArmorSkinGameState()
+    if IsValidObject(GS) then
+        local Arr=nil; pcall(function() Arr=GS.PlayerArray end)
+        for I,RawState in ipairs(ArrayValues(Arr)) do
+            if I>16 then break end
+            local S=Unwrap(RawState)
+            Add(ArmorSkinPawnFromPlayerState(S),ArmorSkinPlayerIdFromState(S),nil)
+        end
+    end
+    table.sort(Out,function(A,B)
+        local AP=tonumber(A.PlayerId) or 9999999
+        local BP=tonumber(B.PlayerId) or 9999999
+        if AP~=BP then return AP<BP end
+        return tostring(A.Key)<tostring(B.Key)
+    end)
+    return Out
+end
+
+function ArmorSkinLocalPlayerIndexForPawn(Pawn)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return nil end
+    for I=1,2 do
+        local P=ArmorSkinGetPawnFromController(GetPlayer(I))
+        if IsValidObject(P) and ArmorSkinSameObject(P,Pawn) then return I end
+    end
+    return nil
+end
+
+function ArmorSkinBipedDirectOwnerPawnKey(Biped, Records)
+    Biped=Unwrap(Biped); if not IsValidObject(Biped) then return nil end
+    for _,R in ipairs(Records or ArmorSkinAllKnownPlayerPawnRecords()) do
+        local Direct=ArmorSkinDirectBipedChild(R.Pawn)
+        if IsValidObject(Direct) and ArmorSkinSameObject(Direct,Biped) then return R.Key end
+    end
+    return nil
+end
+
+
+-- RC3_41 observer-local session-ordinal identity ------------------------------
+-- Important: this path never samples movement and never calls unknown game
+-- functions. PlayerId is used only as the replicated session identity/ordering
+-- token; values such as 256/257/258 are NOT hard-coded to P1/P2. Exact local
+-- Pawn.Children anchors and observer role determine presentation orientation.
+function ArmorSkinResolvePlayerIdOrdinalOrientation(Records, AllBipeds, NewAssign, AllowNetworkHint)
+    if type(Records)~="table" or type(AllBipeds)~="table" then return nil,nil,nil,"invalid" end
+    local N=#Records
+    if N<2 or N>4 or #AllBipeds~=N then return nil,nil,nil,"count-mismatch" end
+
+    local RR,BB={},{}
+    for _,R in ipairs(Records) do
+        if tonumber(R.PlayerId)==nil then return nil,nil,nil,"missing-player-id" end
+        RR[#RR+1]=R
+    end
+    for _,A in ipairs(AllBipeds) do
+        local S=ArmorSkinNumericInstanceSuffix(A.Biped)
+        if S==nil then return nil,nil,nil,"missing-biped-suffix" end
+        A.OrdinalSuffix=S
+        BB[#BB+1]=A
+    end
+    table.sort(RR,function(A,B)
+        local X,Y=tonumber(A.PlayerId),tonumber(B.PlayerId)
+        if X==Y then return tostring(A.Key)<tostring(B.Key) end
+        return X<Y
+    end)
+    table.sort(BB,function(A,B)
+        if A.OrdinalSuffix==B.OrdinalSuffix then return tostring(A.Key)<tostring(B.Key) end
+        return A.OrdinalSuffix>B.OrdinalSuffix
+    end)
+    for I=2,N do
+        if tonumber(RR[I].PlayerId)==tonumber(RR[I-1].PlayerId) then return nil,nil,nil,"duplicate-player-id" end
+        if tonumber(BB[I].OrdinalSuffix)==tonumber(BB[I-1].OrdinalSuffix) then return nil,nil,nil,"duplicate-biped-suffix" end
+    end
+
+    local SameOk,ReverseOk=true,true
+    local Anchors=0
+    local AnchorParts={}
+    for I,R in ipairs(RR) do
+        local Direct=nil
+        if type(NewAssign)=="table" then Direct=Unwrap(NewAssign[R.Key]) end
+        if not IsValidObject(Direct) and R.LocalIndex~=nil then Direct=ArmorSkinDirectBipedChild(R.Pawn) end
+        if IsValidObject(Direct) and R.LocalIndex~=nil then
+            Anchors=Anchors+1
+            local SameMatch=ArmorSkinSameObject(Direct,BB[I].Biped)
+            local RevMatch=ArmorSkinSameObject(Direct,BB[N-I+1].Biped)
+            if not SameMatch then SameOk=false end
+            if not RevMatch then ReverseOk=false end
+            AnchorParts[#AnchorParts+1]=string.format("P%s/L%s->%s same=%s rev=%s",
+                tostring(R.PlayerId),tostring(R.LocalIndex),
+                tostring(string.match(tostring(SafeFullName(Direct) or ""),"BP_SpartansBipedActor_C_%d+") or SafeFullName(Direct) or "?"),
+                tostring(SameMatch),tostring(RevMatch))
+        end
+    end
+    if Anchors<=0 then return nil,RR,BB,"no-local-anchor" end
+
+    local Orientation=nil
+    local Source=nil
+    if SameOk~=ReverseOk then
+        -- A direct local Pawn.Children anchor is always stronger than any
+        -- inferred ordering and remains valid regardless of host/client role.
+        Orientation=SameOk and "same" or "reverse"
+        Source="local-anchor-proof"
+    elseif SameOk and ReverseOk then
+        -- RC3_40 proved the topology orientation is NOT transferable between
+        -- machines. In the 3-player / two-remote case a middle-ranked local
+        -- anchor is compatible with both permutations. Live RC3_40 evidence
+        -- showed the listen server's render order is SAME while the observing
+        -- network client's generated remote presentation order is REVERSE.
+        -- Decide locally from authority role and never consume the peer hint.
+        if N==3 and LivesAuthorityResolved==true then
+            if LivesNetworkClientBlocked==true then
+                Orientation="reverse"
+                Source="observer-local-network-client"
+            elseif LivesAuthorityAllowed==true then
+                Orientation="same"
+                Source="observer-local-authority"
+            end
+        end
+    end
+
+    local Detail=string.format("anchors=%d same=%s reverse=%s peerHint=%s ignored=true source=%s %s",
+        Anchors,tostring(SameOk),tostring(ReverseOk),tostring(ArmorSkinPlayerIdOrdinalHint or "-"),
+        tostring(Source or "unresolved"),table.concat(AnchorParts," | "))
+    return Orientation,RR,BB,Detail
+end
+
+-- RC3_42 explicit remote split-slot identity -------------------------------
+function ArmorSkinNetworkRememberOriginSlot(PlayerId, Slot, Source)
+    PlayerId=tonumber(PlayerId); Slot=tonumber(Slot)
+    if PlayerId==nil or (Slot~=1 and Slot~=2) then return false end
+    local K=tostring(math.floor(PlayerId))
+    local Old=tonumber(ArmorSkinNetworkOriginSlotByPlayerId[K])
+    ArmorSkinNetworkOriginSlotByPlayerId[K]=Slot
+    if Old~=Slot then
+        Log("ARMORSKIN NET origin-slot learned playerId=%d slot=P%d source=%s",PlayerId,Slot,tostring(Source or "network"))
+        -- A changed/first slot label can make a previously ambiguous pair exact.
+        ArmorSkinBipedAssignmentByPawnKey={}
+        ArmorSkinBipedAssignmentMetaByPawnKey={}
+        ArmorSkinBipedAssignmentAuditLogged={}
+        ArmorSkinBipedAnchorPendingLogged={}
+    end
+    return true
+end
+
+function ArmorSkinNetworkOriginSlotForPlayerId(PlayerId)
+    PlayerId=tonumber(PlayerId); if PlayerId==nil then return nil end
+    local LocalIndex=ArmorSkinLocalPlayerIndexForPlayerId(PlayerId)
+    if LocalIndex==1 or LocalIndex==2 then return LocalIndex end
+    local Slot=tonumber(ArmorSkinNetworkOriginSlotByPlayerId[tostring(math.floor(PlayerId))])
+    if Slot==1 or Slot==2 then return Slot end
+    return nil
+end
+
+
+-- RC3_49: map a two-player remote split-screen pair from the source machine's
+-- exact P1->P2 visible-biped displacement. Translation cancels; suffix/order is
+-- never consulted. If the pair is too close or direction is not decisive, wait.
+function ArmorSkinTryPairVectorAssignment(RemotePending,Available,Assign,Compact)
+    local V=ArmorSkinRemotePairVector
+    if type(V)~="table" or #RemotePending~=2 or #Available<2 then return false end
+    if tonumber(V.Generation)~=tonumber(WarthogColorRuntimeGeneration) then return false end
+    local R1,R2=nil,nil
+    for _,R in ipairs(RemotePending) do
+        local PID=tonumber(R.PlayerId)
+        if PID==tonumber(V.P1) then R1=R elseif PID==tonumber(V.P2) then R2=R end
+    end
+    if R1==nil or R2==nil then return false end
+
+    local HL=tonumber(V.Length) or math.sqrt(V.DX*V.DX+V.DY*V.DY+V.DZ*V.DZ)
+    if HL<40 then return false end
+    local Gen=tostring(WarthogColorRuntimeGeneration or 0)
+    local AuditKey=string.format("%s:%s",Gen,tostring(V.Seq or 0))
+
+    -- RC3_58: after respawn, old corpses can coexist with the two new remote
+    -- presentation bipeds. Prefer only actors constructed in the latest burst.
+    if #Available > 2 then
+        local Fresh={}
+        local Last=tonumber(ArmorSkinLastBipedConstructionClock) or 0
+        local Cutoff=Last-(tonumber(ArmorSkinFreshBipedWindowSeconds) or 0.75)
+        local G=tonumber(WarthogColorRuntimeGeneration) or 0
+        for _,A in ipairs(Available) do
+            local M=ArmorSkinFreshBipedByKey and ArmorSkinFreshBipedByKey[A.Key] or nil
+            if type(M)=="table" and tonumber(M.Generation)==G and (tonumber(M.Clock) or 0)>=Cutoff then
+                Fresh[#Fresh+1]=A
+            end
+        end
+        if #Fresh>=2 then
+            local FK=AuditKey..":fresh"
+            if not ArmorSkinPairVectorAuditLogged[FK] then
+                ArmorSkinPairVectorAuditLogged[FK]=true
+                Log("ARMORSKIN PAIRVEC FRESH FILTER seq=%s available=%d fresh=%d",
+                    tostring(V.Seq or "?"),#Available,#Fresh)
+            end
+            Available=Fresh
+        end
+    end
+
+    -- Preserve the already-proven two-candidate behavior unchanged.
+    if #Available==2 then
+        local A1,A2=Available[1],Available[2]
+        local X1,Y1,Z1=ArmorSkinBipedChiefReferenceLocation(A1.Biped)
+        local X2,Y2,Z2=ArmorSkinBipedChiefReferenceLocation(A2.Biped)
+        if X1==nil or X2==nil then return false end
+        local LX,LY,LZ=X2-X1,Y2-Y1,Z2-Z1
+        local LL=math.sqrt(LX*LX+LY*LY+LZ*LZ)
+        local Dot=LX*V.DX+LY*V.DY+LZ*V.DZ
+        local Cos=(LL>0 and HL>0) and (Dot/(LL*HL)) or 0
+        if LL<40 or math.abs(Cos)<0.35 then
+            if not ArmorSkinPairVectorAuditLogged[AuditKey] then
+                ArmorSkinPairVectorAuditLogged[AuditKey]=true
+                Log("ARMORSKIN PAIRVEC WAIT seq=%s hostLen=%.1f remoteLen=%.1f cos=%.3f reason=ambiguous/too-close",
+                    tostring(V.Seq or "?"),HL,LL,Cos)
+            end
+            return false
+        end
+        local First,Second=A1,A2
+        if Cos<0 then First,Second=A2,A1 end
+        Assign(R1,First,"source-pair-vector",0,"exact-source-P1P2-relative-vector")
+        Assign(R2,Second,"source-pair-vector",0,"exact-source-P1P2-relative-vector")
+        Compact()
+        Log("ARMORSKIN PAIRVEC MAPPING seq=%s P1=%s->%s P2=%s->%s hostLen=%.1f remoteLen=%.1f cos=%.3f",
+            tostring(V.Seq or "?"),tostring(R1.PlayerId or "?"),tostring(string.match(First.Key or "","BP_SpartansBipedActor_C_%d+") or First.Key),
+            tostring(R2.PlayerId or "?"),tostring(string.match(Second.Key or "","BP_SpartansBipedActor_C_%d+") or Second.Key),HL,LL,Cos)
+        return true
+    end
+
+    -- RC3_54 respawn path: dead presentation actors may coexist briefly with the
+    -- two newly spawned remote bipeds.  Do not fall back to creation/suffix order.
+    -- Instead evaluate every ORDERED candidate pair against the fresh source
+    -- P1->P2 vector. World translation cancels, and identical UE units mean both
+    -- direction and length should agree. Only a single decisive match is accepted.
+    local P={}
+    for I,A in ipairs(Available) do
+        local X,Y,Z=ArmorSkinBipedChiefReferenceLocation(A.Biped)
+        if X~=nil then P[I]={A=A,X=X,Y=Y,Z=Z} end
+    end
+    local Matches={}
+    for I,PI in pairs(P) do
+        for J,PJ in pairs(P) do
+            if I~=J then
+                local LX,LY,LZ=PJ.X-PI.X,PJ.Y-PI.Y,PJ.Z-PI.Z
+                local LL=math.sqrt(LX*LX+LY*LY+LZ*LZ)
+                if LL>=40 then
+                    local Dot=LX*V.DX+LY*V.DY+LZ*V.DZ
+                    local Cos=Dot/(LL*HL)
+                    local LenErr=math.abs(LL-HL)/math.max(LL,HL)
+                    if Cos>=0.85 and LenErr<=0.30 then
+                        local Score=(1-Cos)+(LenErr*1.5)
+                        Matches[#Matches+1]={First=PI.A,Second=PJ.A,LL=LL,Cos=Cos,LenErr=LenErr,Score=Score}
+                    end
+                end
+            end
+        end
+    end
+    table.sort(Matches,function(A,B) return A.Score<B.Score end)
+    local Best=Matches[1]
+    if Best==nil then
+        if not ArmorSkinPairVectorAuditLogged[AuditKey] then
+            ArmorSkinPairVectorAuditLogged[AuditKey]=true
+            Log("ARMORSKIN PAIRVEC MULTI WAIT seq=%s available=%d hostLen=%.1f reason=no-direction+length-match",
+                tostring(V.Seq or "?"),#Available,HL)
+        end
+        return false
+    end
+    local Second=Matches[2]
+    local Margin=Second and (Second.Score-Best.Score) or 999
+    if Second and Margin<0.08 then
+        if not ArmorSkinPairVectorAuditLogged[AuditKey] then
+            ArmorSkinPairVectorAuditLogged[AuditKey]=true
+            Log("ARMORSKIN PAIRVEC MULTI WAIT seq=%s available=%d bestCos=%.3f bestLenErr=%.3f margin=%.3f reason=non-unique",
+                tostring(V.Seq or "?"),#Available,Best.Cos,Best.LenErr,Margin)
+        end
+        return false
+    end
+
+    Assign(R1,Best.First,"source-pair-vector",0,"exact-source-P1P2-relative-vector-multi")
+    Assign(R2,Best.Second,"source-pair-vector",0,"exact-source-P1P2-relative-vector-multi")
+    Compact()
+    Log("ARMORSKIN PAIRVEC MULTI MAPPING seq=%s available=%d P1=%s->%s P2=%s->%s hostLen=%.1f remoteLen=%.1f cos=%.3f lenErr=%.3f margin=%.3f",
+        tostring(V.Seq or "?"),#Available,tostring(R1.PlayerId or "?"),
+        tostring(string.match(Best.First.Key or "","BP_SpartansBipedActor_C_%d+") or Best.First.Key),
+        tostring(R2.PlayerId or "?"),tostring(string.match(Best.Second.Key or "","BP_SpartansBipedActor_C_%d+") or Best.Second.Key),
+        HL,Best.LL,Best.Cos,Best.LenErr,Margin)
+    return true
+end
+
+function ArmorSkinTryPlayerIdOrdinalAssignment(Records,NewAssign,RemotePending,Available,Assign,Compact,SourcePawn)
+    if #RemotePending<2 then return false end
+    local AllBipeds=ArmorSkinAllCurrentBipedEntries(SourcePawn)
+    local Orientation,RR,BB,Detail=ArmorSkinResolvePlayerIdOrdinalOrientation(Records,AllBipeds,NewAssign,true)
+    if Orientation==nil then
+        local K="pid-ordinal-wait:"..tostring(WarthogColorRuntimeGeneration or 0)
+        if not ArmorSkinOrdinalAuditLogged[K] then
+            ArmorSkinOrdinalAuditLogged[K]=true
+            Log("ARMORSKIN PlayerId ordinal WAIT records=%d bipeds=%d remote=%d detail=%s",#Records,#AllBipeds,#RemotePending,tostring(Detail))
+        end
+        return false
+    end
+
+    local AvailableByKey={}
+    for _,A in ipairs(Available) do AvailableByKey[A.Key]=A end
+    local N=#RR
+    local Mapping={}
+    for I,R in ipairs(RR) do
+        if R.LocalIndex==nil and not NewAssign[R.Key] then
+            local J=(Orientation=="reverse") and (N-I+1) or I
+            local Ranked=BB[J]
+            local A=Ranked and AvailableByKey[Ranked.Key] or nil
+            if A==nil then return false end
+            Mapping[#Mapping+1]=string.format("%s->%s",tostring(R.PlayerId or "?"),
+                tostring(string.match(A.Key or "","BP_SpartansBipedActor_C_%d+") or A.Key))
+            Assign(R,A,"playerid-ordinal-"..Orientation,0,"validated-playerid-order")
+        end
+    end
+    Compact()
+    Log("ARMORSKIN PlayerId ordinal mapping orientation=%s map=%s detail=%s",tostring(Orientation),table.concat(Mapping," | "),tostring(Detail))
+    return #RemotePending==0
+end
+
+function ArmorSkinComputeLocalPlayerIdOrdinalOrientation()
+    local SourcePawn=ArmorSkinGetPawnFromController(GetPlayer(1))
+    if not IsValidObject(SourcePawn) then return nil,"no-local-pawn" end
+    ArmorSkinSeedExactBipedCache()
+    local Records=ArmorSkinAllKnownPlayerPawnRecords()
+    local AllBipeds=ArmorSkinAllCurrentBipedEntries(SourcePawn)
+    local Anchored={}
+    for _,R in ipairs(Records) do
+        if R.LocalIndex~=nil then
+            local D=ArmorSkinDirectBipedChild(R.Pawn)
+            if IsValidObject(D) then Anchored[R.Key]=D end
+        end
+    end
+    local Orientation,_,_,Detail=ArmorSkinResolvePlayerIdOrdinalOrientation(Records,AllBipeds,Anchored,false)
+    return Orientation,Detail
+end
+
+function ArmorSkinNetworkMaybeSendOrdinalHint(Controller,Reason)
+    -- RC3_41: presentation ordering is observer-local, so sending the host's
+    -- orientation to another machine is actively wrong (RC3_40 swapped P1/P2
+    -- on the one-player network client). Keep this no-op for call compatibility.
+    return false
+end
+
+
+-- RC3_39 multi-remote identity ------------------------------------------------
+-- RC3_38 proved that a single-frame common-translation fit is mathematically
+-- ambiguous for the 2-remote topology in A30 (both permutations can have the
+-- same residual).  Use lifecycle identity instead: the game constructs each
+-- BP_MeteoritePawn and its generated BP_SpartansBipedActor in the same player
+-- order.  We never trust that assumption blindly: direct Pawn.Children links
+-- from local players must validate the rank orientation first.
+function ArmorSkinActorCreationTime(Object)
+    Object=Unwrap(Object); if not IsValidObject(Object) then return nil end
+    local V=nil
+    pcall(function() V=Object.CreationTime end)
+    if tonumber(V)==nil then pcall(function() V=Object:GetPropertyValue("CreationTime") end) end
+    V=tonumber(V)
+    if V==nil or V~=V or math.abs(V)>1000000000 then return nil end
+    return V
+end
+
+function ArmorSkinNumericInstanceSuffix(Object)
+    local S=tostring(SafeFullName(Unwrap(Object)) or "")
+    local N=string.match(S,"_([0-9]+)$")
+    return tonumber(N)
+end
+
+function ArmorSkinAllCurrentBipedEntries(SourcePawn)
+    local Out,Seen={},{}
+    for I,Raw in ipairs(ArmorSkinBipedInstanceCache or {}) do
+        if I>96 then break end
+        local B=Unwrap(Raw)
+        if IsValidObject(B) and ArmorSkinSharesRuntimeWorld(B,SourcePawn) then
+            local K=ArmorSkinObjectKey(B) or tostring(SafeFullName(B) or "")
+            if K~="" and not Seen[K] then
+                local Chief=ArmorSkinBipedChiefSlotCount(B)
+                if Chief>0 then
+                    Seen[K]=true
+                    Out[#Out+1]={Biped=B,Key=K,ChiefSlots=Chief}
+                end
+            end
+        end
+    end
+    return Out
+end
+
+function ArmorSkinTryValidatedOrdinalAssignment(Records,NewAssign,RemotePending,Available,Assign,Compact,SourcePawn,Mode)
+    if #RemotePending<2 then return false end
+    local AllBipeds=ArmorSkinAllCurrentBipedEntries(SourcePawn)
+    if #AllBipeds~=#Records or #Records<2 or #Records>4 then return false end
+
+    local RankedRecords,RankedBipeds={},{}
+    for _,R in ipairs(Records) do RankedRecords[#RankedRecords+1]=R end
+    for _,A in ipairs(AllBipeds) do RankedBipeds[#RankedBipeds+1]=A end
+
+    local function RMetric(R)
+        if Mode=="creation-time" then return ArmorSkinActorCreationTime(R.Pawn) end
+        return ArmorSkinNumericInstanceSuffix(R.Pawn)
+    end
+    local function BMetric(A)
+        if Mode=="creation-time" then return ArmorSkinActorCreationTime(A.Biped) end
+        return ArmorSkinNumericInstanceSuffix(A.Biped)
+    end
+    for _,R in ipairs(RankedRecords) do if RMetric(R)==nil then return false end end
+    for _,A in ipairs(RankedBipeds) do if BMetric(A)==nil then return false end end
+
+    local Asc = Mode=="creation-time"
+    table.sort(RankedRecords,function(A,B)
+        local X,Y=RMetric(A),RMetric(B)
+        if X==Y then return tostring(A.Key)<tostring(B.Key) end
+        return Asc and X<Y or X>Y
+    end)
+    table.sort(RankedBipeds,function(A,B)
+        local X,Y=BMetric(A),BMetric(B)
+        if X==Y then return tostring(A.Key)<tostring(B.Key) end
+        return Asc and X<Y or X>Y
+    end)
+
+    -- If the metric collapses to the same value for adjacent actors, it cannot
+    -- establish lifecycle order safely.
+    for I=2,#RankedRecords do
+        if math.abs((RMetric(RankedRecords[I]) or 0)-(RMetric(RankedRecords[I-1]) or 0))<0.000001 then return false end
+    end
+    for I=2,#RankedBipeds do
+        if math.abs((BMetric(RankedBipeds[I]) or 0)-(BMetric(RankedBipeds[I-1]) or 0))<0.000001 then return false end
+    end
+
+    local AnchorCount=0
+    local function OrientationValid(Reverse)
+        local SeenAnchor=0
+        for I,R in ipairs(RankedRecords) do
+            local Direct=Unwrap(NewAssign[R.Key])
+            if IsValidObject(Direct) and R.LocalIndex~=nil then
+                SeenAnchor=SeenAnchor+1
+                local J=Reverse and (#RankedBipeds-I+1) or I
+                if not ArmorSkinSameObject(Direct,RankedBipeds[J].Biped) then return false,SeenAnchor end
+            end
+        end
+        return SeenAnchor>0,SeenAnchor
+    end
+    local SameOk,SameAnchors=OrientationValid(false)
+    local RevOk,RevAnchors=OrientationValid(true)
+    AnchorCount=math.max(SameAnchors or 0,RevAnchors or 0)
+    if SameOk==RevOk then
+        local K="ordinal-wait:"..tostring(WarthogColorRuntimeGeneration or 0)..":"..tostring(Mode)
+        if not ArmorSkinBipedOrdinalAuditLogged[K] then
+            ArmorSkinBipedOrdinalAuditLogged[K]=true
+            Log("ARMORSKIN validated ordinal WAIT mode=%s records=%d bipeds=%d anchors=%d same=%s reverse=%s",
+                tostring(Mode),#RankedRecords,#RankedBipeds,AnchorCount,tostring(SameOk),tostring(RevOk))
+        end
+        return false
+    end
+    local Reverse=RevOk==true
+
+    -- Build a lookup for the still-available remote biped entries. Local bodies
+    -- have already been consumed by direct identity anchors.
+    local AvailableByKey={}
+    for _,A in ipairs(Available) do AvailableByKey[A.Key]=A end
+    local Mapping={}
+    for I,R in ipairs(RankedRecords) do
+        if R.LocalIndex==nil and not NewAssign[R.Key] then
+            local J=Reverse and (#RankedBipeds-I+1) or I
+            local RankedA=RankedBipeds[J]
+            local A=AvailableByKey[RankedA.Key]
+            if A==nil then return false end
+            Mapping[#Mapping+1]=string.format("%s->%s",tostring(R.PlayerId or "?"),
+                tostring(string.match(A.Key or "","BP_SpartansBipedActor_C_%d+") or A.Key))
+            Assign(R,A,"validated-"..tostring(Mode).."-ordinal-"..(Reverse and "reverse" or "same"),0,"lifecycle-order")
+        end
+    end
+    Compact()
+    Log("ARMORSKIN validated ordinal mapping mode=%s orientation=%s anchors=%d map=%s",
+        tostring(Mode),Reverse and "reverse" or "same",AnchorCount,table.concat(Mapping," | "))
+    return #Mapping>0
+end
+
+-- Translation can be huge, but movement DELTAS are translation invariant. If
+-- lifecycle order is unavailable/ambiguous, remember one bounded snapshot and
+-- match later displacement vectors. This never scans outside the exact biped
+-- cache and naturally becomes decisive as soon as either remote player moves.
+function ArmorSkinTryMotionAssignment(RemotePending,Available,Assign,Compact,LocationMode)
+    if #RemotePending<2 or #Available~=#RemotePending or #RemotePending>4 then return false end
+    local PawnLoc,BipedLoc={},{}
+    local SigParts={tostring(LocationMode)}
+    for I,R in ipairs(RemotePending) do
+        local X,Y,Z=ScorpionObjectWorldLocation(R.Pawn); if X==nil then return false end
+        PawnLoc[I]={X=X,Y=Y,Z=Z,Key=R.Key}
+        SigParts[#SigParts+1]="P:"..tostring(R.Key)
+    end
+    for J,A in ipairs(Available) do
+        local X,Y,Z
+        if LocationMode=="actor" then X,Y,Z=ScorpionObjectWorldLocation(A.Biped)
+        else X,Y,Z=ArmorSkinBipedChiefReferenceLocation(A.Biped) end
+        if X==nil then return false end
+        BipedLoc[J]={X=X,Y=Y,Z=Z,Key=A.Key}
+        SigParts[#SigParts+1]="B:"..tostring(A.Key)
+    end
+    local Signature=table.concat(SigParts,"|")
+    local Gen=tostring(WarthogColorRuntimeGeneration or 0)
+    local BaseKey=Gen..":"..tostring(LocationMode)
+    local Base=ArmorSkinBipedMotionBaseline[BaseKey]
+    if Base==nil or Base.Signature~=Signature then
+        local P0,B0={},{}
+        for I,V in ipairs(PawnLoc) do P0[V.Key]={X=V.X,Y=V.Y,Z=V.Z} end
+        for J,V in ipairs(BipedLoc) do B0[V.Key]={X=V.X,Y=V.Y,Z=V.Z} end
+        ArmorSkinBipedMotionBaseline[BaseKey]={Signature=Signature,P=P0,B=B0}
+        Log("ARMORSKIN motion identity baseline armed mode=%s players=%d",tostring(LocationMode),#RemotePending)
+        return false
+    end
+
+    local PDelta,BDelta={},{}
+    local MaxPawnMove,MaxBipedMove=0,0
+    for I,V in ipairs(PawnLoc) do
+        local O=Base.P[V.Key]; if not O then return false end
+        local DX,DY,DZ=V.X-O.X,V.Y-O.Y,V.Z-O.Z
+        local M=math.sqrt(DX*DX+DY*DY+DZ*DZ); if M>MaxPawnMove then MaxPawnMove=M end
+        PDelta[I]={X=DX,Y=DY,Z=DZ,M=M}
+    end
+    for J,V in ipairs(BipedLoc) do
+        local O=Base.B[V.Key]; if not O then return false end
+        local DX,DY,DZ=V.X-O.X,V.Y-O.Y,V.Z-O.Z
+        local M=math.sqrt(DX*DX+DY*DY+DZ*DZ); if M>MaxBipedMove then MaxBipedMove=M end
+        BDelta[J]={X=DX,Y=DY,Z=DZ,M=M}
+    end
+    if MaxPawnMove<25.0 or MaxBipedMove<25.0 then return false end
+
+    local Best,Second=nil,nil
+    local Used,Choice={},{}
+    local function Evaluate()
+        local SumSq,MaxErr=0,0
+        local Residual={}
+        for I=1,#RemotePending do
+            local P,B=PDelta[I],BDelta[Choice[I]]
+            local DX,DY,DZ=B.X-P.X,B.Y-P.Y,B.Z-P.Z
+            local E=math.sqrt(DX*DX+DY*DY+DZ*DZ)
+            Residual[I]=E; SumSq=SumSq+E*E; if E>MaxErr then MaxErr=E end
+        end
+        local RMS=math.sqrt(SumSq/#RemotePending)
+        local C={Score=RMS,MaxErr=MaxErr,Choice={},Residual=Residual}
+        for I=1,#RemotePending do C.Choice[I]=Choice[I] end
+        if Best==nil or C.Score<Best.Score then Second=Best; Best=C
+        elseif Second==nil or C.Score<Second.Score then Second=C end
+    end
+    local function Recurse(I)
+        if I>#RemotePending then Evaluate(); return end
+        for J=1,#Available do if not Used[J] then
+            Used[J]=true; Choice[I]=J; Recurse(I+1); Used[J]=nil
+        end end
+    end
+    Recurse(1)
+    if Best==nil then return false end
+    local SecondScore=Second and Second.Score or nil
+    local Margin=SecondScore and (SecondScore-Best.Score) or 999999
+    if Best.Score>175.0 or Best.MaxErr>300.0 or (Second~=nil and Margin<50.0) then
+        return false
+    end
+    local Mapping={}
+    for I,R in ipairs(RemotePending) do
+        local A=Available[Best.Choice[I]]
+        Mapping[#Mapping+1]=string.format("%s->%s(err=%.1f)",tostring(R.PlayerId or "?"),
+            tostring(string.match(A.Key or "","BP_SpartansBipedActor_C_%d+") or A.Key),Best.Residual[I] or -1)
+        Assign(R,A,"motion-delta-"..tostring(LocationMode),Best.Residual[I],"translation-invariant-motion")
+    end
+    Compact()
+    Log("ARMORSKIN motion identity mapping mode=%s players=%d rms=%.1f maxErr=%.1f margin=%.1f pawnMove=%.1f bipedMove=%.1f map=%s",
+        tostring(LocationMode),#Mapping,Best.Score,Best.MaxErr,Margin,MaxPawnMove,MaxBipedMove,table.concat(Mapping," | "))
+    return #Mapping>0
+end
+
+function ArmorSkinClearBipedAssignments(Reason)
+    ArmorSkinBipedAssignmentByPawnKey = {}
+    ArmorSkinBipedAssignmentMetaByPawnKey = {}
+    ArmorSkinBipedAssignmentAuditLogged = {}
+    ArmorSkinBipedAnchorPendingLogged = {}
+    ArmorSkinBipedMotionBaseline = {}
+    ArmorSkinBipedOrdinalAuditLogged = {}
+    ArmorSkinOrdinalAuditLogged = {}
+    ArmorSkinRemoteSplitSlotAuditLogged = {}
+    if Reason ~= nil and tostring(Reason) ~= "" then
+        Log("ARMORSKIN biped assignments invalidated reason=%s", tostring(Reason))
+    end
+end
+
+function ArmorSkinBuildBipedAssignments(SourcePawn)
+    SourcePawn=Unwrap(SourcePawn)
+    if not IsValidObject(SourcePawn) then return end
+    ArmorSkinSeedExactBipedCache()
+
+    local Records=ArmorSkinAllKnownPlayerPawnRecords()
+    local NewAssign,NewMeta,UsedBiped={}, {}, {}
+    local RemotePending={}
+    local MissingLocalAnchors=0
+
+    -- Direct Pawn.Children is the strongest identity anchor and is mandatory for
+    -- every local split-screen player before remote inference is allowed.
+    for _,R in ipairs(Records) do
+        local Direct=ArmorSkinDirectBipedChild(R.Pawn)
+        if IsValidObject(Direct) then
+            local BK=ArmorSkinObjectKey(Direct) or tostring(SafeFullName(Direct) or "")
+            NewAssign[R.Key]=Direct
+            NewMeta[R.Key]={Route="Pawn.Children",Distance=0,PlayerId=R.PlayerId,ChiefSlots=ArmorSkinBipedChiefSlotCount(Direct)}
+            if BK~="" then
+                UsedBiped[BK]=true
+                if tonumber(R.PlayerId)~=nil then
+                    ArmorSkinLastKnownBipedKeyByPlayerId[tostring(math.floor(tonumber(R.PlayerId)))]=BK
+                end
+            end
+        elseif R.LocalIndex~=nil then
+            MissingLocalAnchors=MissingLocalAnchors+1
+        else
+            RemotePending[#RemotePending+1]=R
+        end
+    end
+
+    ArmorSkinBipedAssignmentByPawnKey=NewAssign
+    ArmorSkinBipedAssignmentMetaByPawnKey=NewMeta
+
+    if MissingLocalAnchors>0 then
+        local K="gen:"..tostring(WarthogColorRuntimeGeneration or 0)
+        if not ArmorSkinBipedAnchorPendingLogged[K] then
+            ArmorSkinBipedAnchorPendingLogged[K]=true
+            Log("ARMORSKIN biped assignment WAIT localAnchors=%d records=%d cached=%d; remote guessing disabled",
+                MissingLocalAnchors,#Records,#(ArmorSkinBipedInstanceCache or {}))
+        end
+        return
+    end
+
+    local Available={}
+    -- RC3_58 fast respawn path: when two remote split players are unresolved,
+    -- look at only the actors from the latest construction burst first. This
+    -- avoids touching old corpse presentation actors at all.
+    local FreshSource={}
+    if #RemotePending==2 and (tonumber(ArmorSkinLastBipedConstructionClock) or 0)>0 then
+        local Last=tonumber(ArmorSkinLastBipedConstructionClock) or 0
+        local Cutoff=Last-(tonumber(ArmorSkinFreshBipedWindowSeconds) or 0.75)
+        local G=tonumber(WarthogColorRuntimeGeneration) or 0
+        for K,M in pairs(ArmorSkinFreshBipedByKey or {}) do
+            if type(M)=="table" and tonumber(M.Generation)==G and (tonumber(M.Clock) or 0)>=Cutoff then
+                FreshSource[#FreshSource+1]=M.Biped
+            end
+        end
+    end
+    local SourceList=(#FreshSource>=2) and FreshSource or (ArmorSkinBipedInstanceCache or {})
+    for I,Raw in ipairs(SourceList) do
+        if I>96 then break end
+        local B=Unwrap(Raw)
+        if IsValidObject(B) and ArmorSkinSharesRuntimeWorld(B,SourcePawn) then
+            local BK=ArmorSkinObjectKey(B) or tostring(SafeFullName(B) or "")
+            if BK~="" and not UsedBiped[BK] then
+                local ChiefSlots=ArmorSkinBipedChiefSlotCount(B)
+                if ChiefSlots>0 then Available[#Available+1]={Biped=B,Key=BK,ChiefSlots=ChiefSlots} end
+            end
+        end
+    end
+    if #FreshSource>=2 then
+        local FK="fresh-fast:"..tostring(WarthogColorRuntimeGeneration or 0)..":"..tostring(#FreshSource)..":"..tostring(#Available)
+        if not ArmorSkinBipedOrdinalAuditLogged[FK] then
+            ArmorSkinBipedOrdinalAuditLogged[FK]=true
+            Log("ARMORSKIN fresh respawn candidate fast-path remote=%d freshSource=%d available=%d",
+                #RemotePending,#FreshSource,#Available)
+        end
+    end
+    table.sort(Available,function(A,B) return tostring(A.Key)<tostring(B.Key) end)
+    if #RemotePending==0 or #Available==0 then return end
+
+    local function Assign(R,A,Route,Distance,DistanceRoute)
+        NewAssign[R.Key]=A.Biped
+        NewMeta[R.Key]={Route=Route,Distance=Distance,DistanceRoute=DistanceRoute,PlayerId=R.PlayerId,ChiefSlots=A.ChiefSlots}
+        UsedBiped[A.Key]=true
+        if tonumber(R.PlayerId)~=nil and tostring(A.Key or "")~="" then
+            ArmorSkinLastKnownBipedKeyByPlayerId[tostring(math.floor(tonumber(R.PlayerId)))]=tostring(A.Key)
+        end
+    end
+    local function Compact()
+        local RP,AV={},{}
+        for _,R in ipairs(RemotePending) do if not NewAssign[R.Key] then RP[#RP+1]=R end end
+        for _,A in ipairs(Available) do if not UsedBiped[A.Key] then AV[#AV+1]=A end end
+        RemotePending,Available=RP,AV
+        ArmorSkinBipedAssignmentByPawnKey=NewAssign
+        ArmorSkinBipedAssignmentMetaByPawnKey=NewMeta
+    end
+
+    -- V15 two-player respawn identity: after local Pawn.Children anchors have
+    -- reserved the local body, one freshly constructed *unused* biped is exact
+    -- evidence that the sole remote player respawned. If the fresh biped was
+    -- consumed by the local anchor instead, the remote player did not respawn,
+    -- so reuse only its previously proven string key. No suffix/order guessing.
+    if #RemotePending==1 then
+        local R=RemotePending[1]
+        local FreshCandidates={}
+        local LastConstruction=tonumber(ArmorSkinLastBipedConstructionClock) or 0
+        local Cutoff=LastConstruction-(tonumber(ArmorSkinFreshBipedWindowSeconds) or 0.75)
+        local G=tonumber(WarthogColorRuntimeGeneration) or 0
+        for _,A in ipairs(Available) do
+            local FM=ArmorSkinFreshBipedByKey and ArmorSkinFreshBipedByKey[A.Key] or nil
+            if type(FM)=="table" and tonumber(FM.Generation)==G and (tonumber(FM.Clock) or 0)>=Cutoff then
+                FreshCandidates[#FreshCandidates+1]=A
+            end
+        end
+        if #FreshCandidates==1 then
+            local A=FreshCandidates[1]
+            local D,DR=ArmorSkinBipedDistanceToPawn(A.Biped,R.Pawn)
+            Assign(R,A,"single-remote-fresh-respawn",D,DR)
+            Compact()
+            Log("CLASSIC18V15 remote identity lifecycle fresh playerId=%s biped=%s",
+                tostring(R.PlayerId or "?"),tostring(A.Key or "?"))
+            return
+        end
+        local LastKey=tonumber(R.PlayerId)~=nil and ArmorSkinLastKnownBipedKeyByPlayerId[tostring(math.floor(tonumber(R.PlayerId)))] or nil
+        if LastKey~=nil then
+            for _,A in ipairs(Available) do
+                if tostring(A.Key)==tostring(LastKey) then
+                    local D,DR=ArmorSkinBipedDistanceToPawn(A.Biped,R.Pawn)
+                    Assign(R,A,"single-remote-previous-proven-key",D,DR)
+                    Compact()
+                    Log("CLASSIC18V15 remote identity preserved playerId=%s biped=%s",
+                        tostring(R.PlayerId or "?"),tostring(A.Key or "?"))
+                    return
+                end
+            end
+        end
+    end
+
+    -- First use actual UObject owner/attachment/parent identity when the remote
+    -- presentation exposes it. Require a one-to-one match on both sides.
+    local Matches,Reverse={},{}
+    for RI,R in ipairs(RemotePending) do
+        Matches[RI]={}
+        for AI,A in ipairs(Available) do
+            local Linked,Route=ArmorSkinObjectChainReachesPawn(A.Biped,R.Pawn)
+            if Linked then
+                Matches[RI][#Matches[RI]+1]={AI=AI,Route=Route}
+                Reverse[AI]=(Reverse[AI] or 0)+1
+            end
+        end
+    end
+    for RI,M in ipairs(Matches) do
+        if #M==1 and Reverse[M[1].AI]==1 then
+            local R,A=RemotePending[RI],Available[M[1].AI]
+            Assign(R,A,"biped-object-chain:"..tostring(M[1].Route),0,"identity")
+        end
+    end
+    Compact()
+    if #RemotePending==0 then return end
+
+    -- After every local anchor is reserved, one remaining remote body is exact
+    -- by elimination. This is the RC3_35/36 route already proven in 2-player net.
+    if #RemotePending==1 and #Available==1 then
+        local R,A=RemotePending[1],Available[1]
+        local D,DR=ArmorSkinBipedDistanceToPawn(A.Biped,R.Pawn)
+        Assign(R,A,"unique-remainder",D,DR)
+        Compact(); return
+    end
+    if #Available < #RemotePending then return end
+
+    -- RC3_49: prefer the source machine's exact P1->P2 biped displacement.
+    -- This is identity-safe under arbitrary translation and never uses suffix order.
+    if ArmorSkinTryPairVectorAssignment(RemotePending,Available,Assign,Compact) then return end
+
+    -- RC3_53: do NOT run RC3_47 reflection from the live color-apply path.
+    -- When the split pair-vector is missing this scan blocks the game thread for
+    -- seconds and still cannot prove identity. SAFE WAIT is preferable to a hitch.
+
+    -- Retain motion only as a cheap translation-invariant fallback. The RC3_46
+    -- calibrated absolute-space fit is intentionally disabled: live data showed
+    -- the two remote pawns collapse to the same presentation-space matrix.
+    if ArmorSkinTryMotionAssignment(RemotePending,Available,Assign,Compact,"actor") then return end
+    if ArmorSkinTryMotionAssignment(RemotePending,Available,Assign,Compact,"chief") then return end
+
+    local K="multi-safe-wait:"..tostring(WarthogColorRuntimeGeneration or 0)
+    if not ArmorSkinBipedAnchorPendingLogged[K] then
+        ArmorSkinBipedAnchorPendingLogged[K]=true
+        local Slots={}
+        for _,R in ipairs(RemotePending) do
+            Slots[#Slots+1]=string.format("%s:P%s",tostring(R.PlayerId or "?"),tostring(ArmorSkinNetworkOriginSlotForPlayerId(R.PlayerId) or "?"))
+        end
+        Log("ARMORSKIN biped assignment SAFE WAIT remote=%d available=%d slots=%s; deterministic identity pending (object-chain/lifecycle/motion); no suffix/role guessing",
+            #RemotePending,#Available,table.concat(Slots,","))
+    end
+
+end
+
+function ArmorSkinFindAssignedBiped(Pawn)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return nil end
+    local PK=ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+
+    -- Always re-check the identity-safe direct relation before trusting cache.
+    -- This repairs the exact lifecycle race seen in RC3_35 when Pawn.Children
+    -- becomes populated after the first network message.
+    local Direct=ArmorSkinDirectBipedChild(Pawn)
+    if IsValidObject(Direct) then
+        local Old=Unwrap(ArmorSkinBipedAssignmentByPawnKey[PK])
+        if not IsValidObject(Old) or not ArmorSkinSameObject(Old,Direct) then
+            ArmorSkinBipedAssignmentAuditLogged[PK]=nil
+        end
+        ArmorSkinBipedAssignmentByPawnKey[PK]=Direct
+        ArmorSkinBipedAssignmentMetaByPawnKey[PK]={Route="Pawn.Children",Distance=0,PlayerId=ArmorSkinPlayerIdFromPawn(Pawn),ChiefSlots=ArmorSkinBipedChiefSlotCount(Direct)}
+        return Direct
+    end
+
+    -- A local player without its direct biped anchor is still constructing.
+    -- Never let a spatial/remainder resolver paint another player's body.
+    if ArmorSkinLocalPlayerIndexForPawn(Pawn)~=nil then
+        ArmorSkinBipedAssignmentByPawnKey[PK]=nil
+        ArmorSkinBipedAssignmentMetaByPawnKey[PK]=nil
+        ArmorSkinBuildBipedAssignments(Pawn)
+        return nil
+    end
+
+    local B=Unwrap(ArmorSkinBipedAssignmentByPawnKey[PK])
+    if IsValidObject(B) then
+        -- If a previously assigned remote biped later becomes the direct child
+        -- of some other pawn, invalidate immediately and rebuild.
+        local OwnerKey=ArmorSkinBipedDirectOwnerPawnKey(B)
+        if OwnerKey~=nil and tostring(OwnerKey)~=tostring(PK) then
+            ArmorSkinBipedAssignmentByPawnKey[PK]=nil
+            ArmorSkinBipedAssignmentMetaByPawnKey[PK]=nil
+            ArmorSkinBipedAssignmentAuditLogged[PK]=nil
+            B=nil
+        end
+    end
+    if not IsValidObject(B) then
+        ArmorSkinBuildBipedAssignments(Pawn)
+        B=Unwrap(ArmorSkinBipedAssignmentByPawnKey[PK])
+    end
+
+    if IsValidObject(B) then
+        local Meta=ArmorSkinBipedAssignmentMetaByPawnKey[PK] or {}
+        if not ArmorSkinBipedAssignmentAuditLogged[PK] then
+            ArmorSkinBipedAssignmentAuditLogged[PK]=true
+            Log("ARMORSKIN biped assignment playerId=%s pawn=%s biped=%s route=%s distance=%s distanceRoute=%s chiefSlots=%s",
+                tostring(Meta.PlayerId or ArmorSkinPlayerIdFromPawn(Pawn) or "?"),tostring(SafeFullName(Pawn) or Pawn),
+                tostring(SafeFullName(B) or B),tostring(Meta.Route or "cached"),
+                Meta.Distance~=nil and string.format("%.1f",tonumber(Meta.Distance) or -1) or "-",
+                tostring(Meta.DistanceRoute or "-"),tostring(Meta.ChiefSlots or ArmorSkinBipedChiefSlotCount(B)))
+        end
+        return B
+    end
+
+    if not ArmorSkinBipedAssignmentAuditLogged["fail:"..PK] then
+        ArmorSkinBipedAssignmentAuditLogged["fail:"..PK]=true
+        local Parts={}
+        for I,Raw in ipairs(ArmorSkinBipedInstanceCache or {}) do
+            if I>8 then break end
+            local C=Unwrap(Raw)
+            if IsValidObject(C) then
+                local D,DR=ArmorSkinBipedDistanceToPawn(C,Pawn)
+                Parts[#Parts+1]=string.format("#%d %s chief=%d dist=%s via=%s world=%s",I,tostring(SafeFullName(C) or C),ArmorSkinBipedChiefSlotCount(C),D and string.format("%.1f",D) or "-",tostring(DR),tostring(ArmorSkinSharesRuntimeWorld(C,Pawn)))
+            end
+        end
+        Log("ARMORSKIN biped assignment unresolved playerId=%s pawn=%s cached=%d detail=%s",tostring(ArmorSkinPlayerIdFromPawn(Pawn) or "?"),tostring(SafeFullName(Pawn) or Pawn),#(ArmorSkinBipedInstanceCache or {}),table.concat(Parts," | "))
+    end
+    return nil
+end
+
+function ArmorSkinFindSpatialBiped(Pawn)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return nil end
+    return ArmorSkinFindAssignedBiped(Pawn)
+end
+
+function ArmorSkinFindThirdPersonBiped(Pawn)
+    Pawn = Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return nil end
+
+    -- Fast/local route retained unchanged.
+    local Children = nil
+    pcall(function() Children = Pawn.Children end)
+    for _, ChildValue in ipairs(ArrayValues(Children)) do
+        local Child = Unwrap(ChildValue)
+        if IsValidObject(Child) and ArmorSkinContainsCI(SafeFullName(Child), "BP_SpartansBipedActor_C") then
+            ArmorSkinCacheBipedInstance(Child, "Pawn.Children")
+            return Child
+        end
+    end
+
+    -- Replicated ChildActorComponent children are not guaranteed to appear in
+    -- AActor.Children. The component itself still belongs to the exact pawn, so
+    -- ChildActor/GetChildActor and attached-component owner are identity-safe.
+    for ComponentIndex, RawComponent in ipairs(WarthogGetActorComponents(Pawn) or {}) do
+        if ComponentIndex > 128 then break end
+        local Component = Unwrap(RawComponent)
+        if IsValidObject(Component) then
+            local Candidate = nil
+            pcall(function() Candidate = Unwrap(Component:GetChildActor()) end)
+            if not IsValidObject(Candidate) then pcall(function() Candidate = Unwrap(Component.ChildActor) end) end
+            if IsValidObject(Candidate) and ArmorSkinContainsCI(SafeFullName(Candidate), "BP_SpartansBipedActor_C") then
+                local PawnKey = ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+                if not ArmorSkinRemoteBipedRouteLogged[PawnKey] then
+                    ArmorSkinRemoteBipedRouteLogged[PawnKey] = true
+                    Log("ARMORSKIN remote biped resolved pawn=%s biped=%s route=PawnComponent[%d].ChildActor",
+                        tostring(SafeFullName(Pawn) or Pawn), tostring(SafeFullName(Candidate) or Candidate), ComponentIndex)
+                end
+                ArmorSkinCacheBipedInstance(Candidate, "PawnComponent.ChildActor")
+                return Candidate
+            end
+
+            local AttachChildren = nil
+            pcall(function() AttachChildren = Component.AttachChildren end)
+            for ChildIndex, RawChildComponent in ipairs(ArrayValues(AttachChildren)) do
+                if ChildIndex > 48 then break end
+                local ChildComponent = Unwrap(RawChildComponent)
+                if IsValidObject(ChildComponent) then
+                    local Owner = nil
+                    pcall(function() Owner = Unwrap(ChildComponent:GetOwner()) end)
+                    if IsValidObject(Owner) and ArmorSkinContainsCI(SafeFullName(Owner), "BP_SpartansBipedActor_C") then
+                        local Linked = select(1, ArmorSkinObjectChainReachesPawn(Owner, Pawn))
+                        if Linked then
+                            local PawnKey = ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+                            if not ArmorSkinRemoteBipedRouteLogged[PawnKey] then
+                                ArmorSkinRemoteBipedRouteLogged[PawnKey] = true
+                                Log("ARMORSKIN remote biped resolved pawn=%s biped=%s route=PawnComponent[%d].AttachChildren[%d].Owner",
+                                    tostring(SafeFullName(Pawn) or Pawn), tostring(SafeFullName(Owner) or Owner), ComponentIndex, ChildIndex)
+                            end
+                            ArmorSkinCacheBipedInstance(Owner, "AttachChildren.Owner")
+                            return Owner
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- RC3_41: do not perform a separate global FindAllOf here. Exact biped
+    -- instances are cached by the runtime-class listener / bounded seed and
+    -- identity-mapped below.
+    local PawnName = tostring(SafeFullName(Pawn) or "")
+    local Candidates = {}
+
+    -- RC3_34: exact-UClass cache + spatial player assignment. This scans only
+    -- BP_SpartansBipedActor_C instances and is therefore safe on WinGDK.
+    local SpatialBiped = ArmorSkinFindSpatialBiped(Pawn)
+    if IsValidObject(SpatialBiped) then return SpatialBiped end
+
+    local PawnKey = ArmorSkinObjectKey(Pawn) or PawnName
+    if not ArmorSkinRemoteBipedFailureLogged[PawnKey] then
+        ArmorSkinRemoteBipedFailureLogged[PawnKey] = true
+        local Detail = {}
+        local Shown = 0
+        for _, RawCandidate in ipairs(Candidates or {}) do
+            if Shown >= 6 then break end
+            local Candidate = Unwrap(RawCandidate)
+            if IsValidObject(Candidate) then
+                local CandidateName = tostring(SafeFullName(Candidate) or "")
+                if ArmorSkinSharesRuntimeWorld(Candidate, Pawn) then
+                    Shown = Shown + 1
+                    local Owner, ParentActor, ParentComponent = nil, nil, nil
+                    pcall(function() Owner = Unwrap(Candidate:GetOwner()) end)
+                    pcall(function() ParentActor = Unwrap(Candidate:GetParentActor()) end)
+                    pcall(function() ParentComponent = Unwrap(Candidate:GetParentComponent()) end)
+                    Detail[#Detail + 1] = string.format("#%d owner=%s parentActor=%s parentComp=%s",
+                        Shown,
+                        tostring(SafeFullName(Owner) or "-"),
+                        tostring(SafeFullName(ParentActor) or "-"),
+                        tostring(SafeFullName(ParentComponent) or "-"))
+                end
+            end
+        end
+        Log("ARMORSKIN remote biped unresolved pawn=%s candidates=%d detail=%s",
+            PawnName, Shown, table.concat(Detail, " | "))
+    end
+    return nil
+end
+
+function ArmorSkinGetMaterialSlots(Component)
+    local Output = {}
+    Component = Unwrap(Component)
+    if not IsValidObject(Component) then return Output end
+    local Count = nil
+    pcall(function() Count = tonumber(Component:GetNumMaterials()) end)
+    if Count == nil or Count <= 0 or Count >= 64 then return Output end
+    for Slot = 0, Count - 1 do
+        local Material = nil
+        pcall(function() Material = Unwrap(Component:GetMaterial(Slot)) end)
+        if IsValidObject(Material) then Output[#Output + 1] = { Slot = Slot, Material = Material } end
+    end
+    return Output
+end
+
+function ArmorSkinParameterInfoFields(Entry)
+    Entry = Unwrap(Entry)
+    if Entry == nil then return nil, "", nil, nil end
+    local Info = nil
+    pcall(function() Info = Unwrap(Entry.ParameterInfo) end)
+    if Info == nil then return nil, "", nil, nil end
+    local Name, Association, Index = nil, nil, nil
+    pcall(function() Name = Unwrap(Info.Name) end)
+    pcall(function() Association = Unwrap(Info.Association) end)
+    pcall(function() Index = Unwrap(Info.Index) end)
+    return Info, SafeToString(Name), Association, Index
+end
+
+function ArmorSkinFindDiffuseParams(Material)
+    Material = Unwrap(Material)
+    if not IsValidObject(Material) then return nil, "material unavailable" end
+    local Out, SeenParam, SeenMaterial = {}, {}, {}
+    local Current = Material
+    for _ = 1, 8 do
+        if not IsValidObject(Current) then break end
+        local MK = tostring(SafeFullName(Current) or "")
+        if MK == "" or SeenMaterial[MK] then break end
+        SeenMaterial[MK] = true
+        local Values = nil
+        pcall(function() Values = Current.TextureParameterValues end)
+        for _, Entry in ipairs(ArrayValues(Values)) do
+            local Info, Name, Association, Index = ArmorSkinParameterInfoFields(Entry)
+            local Texture = nil
+            pcall(function() Texture = Unwrap(Entry.ParameterValue) end)
+            if Info ~= nil and IsValidObject(Texture) and string.lower(tostring(Name or "")) == "diffuse map" then
+                local K = tostring(Association or 0) .. ":" .. tostring(Index or 0)
+                if not SeenParam[K] then
+                    SeenParam[K] = true
+                    Out[#Out + 1] = { Info = Info, Association = Association, Index = Index }
+                end
+            end
+        end
+        Current = WarthogMaterialParent(Current)
+    end
+    if #Out == 0 then return nil, "layered Diffuse Map parameters unavailable" end
+    return Out, nil
+end
+
+-- RC3_27: the RC3_26 live log proved the discovered BPC_FP_SkeletalMesh_C
+-- remains bound to all seven MIDs (detachedBefore=0), yet the visible first-person
+-- arms stay green. That rules out the old rebind theory. First-person materials
+-- can use a different Infinite-derived parameter layout from the third-person
+-- Spartan material, so discover their color-bearing texture/vector overrides too.
+function ArmorSkinFirstPersonParamKey(Name, Association, Index)
+    return string.lower(tostring(Name or "")) .. "|" .. tostring(Association or 0) .. "|" .. tostring(Index or 0)
+end
+
+function ArmorSkinFirstPersonTextureParamCandidate(Name, Texture)
+    local N = string.lower(tostring(Name or ""))
+    local T = string.lower(tostring(SafeFullName(Unwrap(Texture)) or ""))
+    local Excluded = string.find(N, "normal", 1, true) ~= nil
+        or string.find(N, "rough", 1, true) ~= nil
+        or string.find(N, "metal", 1, true) ~= nil
+        or string.find(N, "spec", 1, true) ~= nil
+        or string.find(N, "mask", 1, true) ~= nil
+        or string.find(N, "orm", 1, true) ~= nil
+        or string.find(N, "emiss", 1, true) ~= nil
+        or string.find(N, "opacity", 1, true) ~= nil
+        or string.find(N, "height", 1, true) ~= nil
+    if Excluded then return false end
+    if string.find(N, "diffuse", 1, true) ~= nil
+        or string.find(N, "albedo", 1, true) ~= nil
+        or string.find(N, "base color", 1, true) ~= nil
+        or string.find(N, "basecolor", 1, true) ~= nil
+        or string.find(N, "color map", 1, true) ~= nil
+        or string.find(N, "colormap", 1, true) ~= nil then
+        return true
+    end
+    return string.find(T, "chief", 1, true) ~= nil
+        or string.find(T, "spartan", 1, true) ~= nil
+        or string.find(T, "markv", 1, true) ~= nil
+        or string.find(T, "mark_v", 1, true) ~= nil
+        or string.find(T, "armor", 1, true) ~= nil
+        or string.find(T, "arm_", 1, true) ~= nil
+        or string.find(T, "arms", 1, true) ~= nil
+        or string.find(T, "glove", 1, true) ~= nil
+end
+
+function ArmorSkinFirstPersonVectorParamCandidate(Name, Value)
+    local N = string.lower(tostring(Name or ""))
+    local Excluded = string.find(N, "emiss", 1, true) ~= nil
+        or string.find(N, "light", 1, true) ~= nil
+        or string.find(N, "fresnel", 1, true) ~= nil
+        or string.find(N, "rim", 1, true) ~= nil
+        or string.find(N, "spec", 1, true) ~= nil
+        or string.find(N, "rough", 1, true) ~= nil
+        or string.find(N, "metal", 1, true) ~= nil
+        or string.find(N, "shield", 1, true) ~= nil
+        or string.find(N, "damage", 1, true) ~= nil
+        or string.find(N, "blood", 1, true) ~= nil
+    if Excluded then return false end
+    if WarthogLooksLikeOriginalOlive(Value) then return true end
+    return string.find(N, "tint", 1, true) ~= nil
+        or string.find(N, "primary", 1, true) ~= nil
+        or string.find(N, "armor", 1, true) ~= nil
+        or string.find(N, "armour", 1, true) ~= nil
+        or string.find(N, "paint", 1, true) ~= nil
+        or string.find(N, "base color", 1, true) ~= nil
+        or string.find(N, "basecolor", 1, true) ~= nil
+        or N == "color" or N == "colour"
+end
+
+function ArmorSkinCollectFirstPersonParams(Material)
+    local TextureParams, VectorParams = {}, {}
+    local SeenTex, SeenVec, SeenMaterial = {}, {}, {}
+    local Current = Unwrap(Material)
+    for _ = 1, 10 do
+        if not IsValidObject(Current) then break end
+        local MaterialKey = tostring(SafeFullName(Current) or "")
+        if MaterialKey == "" or SeenMaterial[MaterialKey] then break end
+        SeenMaterial[MaterialKey] = true
+
+        local Textures = nil
+        pcall(function() Textures = Current.TextureParameterValues end)
+        for _, RawEntry in ipairs(ArrayValues(Textures)) do
+            local Entry = Unwrap(RawEntry)
+            local Info, Name, Association, Index = ArmorSkinParameterInfoFields(Entry)
+            local ParameterValue = nil
+            pcall(function() ParameterValue = Unwrap(Entry.ParameterValue) end)
+            local Key = ArmorSkinFirstPersonParamKey(Name, Association, Index)
+            if Info ~= nil and not SeenTex[Key] and ArmorSkinFirstPersonTextureParamCandidate(Name, ParameterValue) then
+                SeenTex[Key] = true
+                TextureParams[#TextureParams + 1] = {
+                    Info=Info, Name=Name, Association=Association, Index=Index, Original=ParameterValue,
+                }
+            end
+        end
+
+        local Vectors = nil
+        pcall(function() Vectors = Current.VectorParameterValues end)
+        for _, RawEntry in ipairs(ArrayValues(Vectors)) do
+            local Entry = Unwrap(RawEntry)
+            local Info, Name, Association, Index = ArmorSkinParameterInfoFields(Entry)
+            local ParameterValue = nil
+            pcall(function() ParameterValue = Unwrap(Entry.ParameterValue) end)
+            local Copy = WarthogCopyLinearColor(ParameterValue)
+            local Key = ArmorSkinFirstPersonParamKey(Name, Association, Index)
+            if Info ~= nil and Copy ~= nil and not SeenVec[Key]
+                and ArmorSkinFirstPersonVectorParamCandidate(Name, Copy) then
+                SeenVec[Key] = true
+                VectorParams[#VectorParams + 1] = {
+                    Info=Info, Name=Name, Association=Association, Index=Index, Original=Copy,
+                }
+            end
+        end
+        Current = WarthogMaterialParent(Current)
+    end
+    return TextureParams, VectorParams
+end
+
+function ArmorSkinSetFirstPersonOverrides(MID, DiffuseParams, TextureParams, VectorParams, Texture, ColorIndex)
+    MID = Unwrap(MID)
+    Texture = Unwrap(Texture)
+    if not IsValidObject(MID) or not IsValidObject(Texture) then return false, 0, 0, 0 end
+    local TextureSets, NameSets, VectorSets = 0, 0, 0
+    local SeenByInfo = {}
+
+    for _, Param in ipairs(DiffuseParams or {}) do
+        local Key = ArmorSkinFirstPersonParamKey("Diffuse Map", Param.Association, Param.Index)
+        local Ok = pcall(function() MID:SetTextureParameterValueByInfo(Param.Info, Texture) end)
+        if Ok then TextureSets = TextureSets + 1; SeenByInfo[Key] = true end
+    end
+    for _, Param in ipairs(TextureParams or {}) do
+        local Key = ArmorSkinFirstPersonParamKey(Param.Name, Param.Association, Param.Index)
+        if not SeenByInfo[Key] then
+            local Ok = pcall(function() MID:SetTextureParameterValueByInfo(Param.Info, Texture) end)
+            if Ok then TextureSets = TextureSets + 1; SeenByInfo[Key] = true end
+        end
+        if tostring(Param.Name or "") ~= "" then
+            local Ok = pcall(function() MID:SetTextureParameterValue(FName(tostring(Param.Name)), Texture) end)
+            if Ok then NameSets = NameSets + 1 end
+        end
+    end
+
+    local Color = WarthogCEColors[tonumber(ColorIndex) or 0]
+    local Linear = Color and WarthogColorLinear(Color) or nil
+    if Linear ~= nil then
+        for _, Param in ipairs(VectorParams or {}) do
+            local Ok = pcall(function() MID:SetVectorParameterValueByInfo(Param.Info, Linear) end)
+            if Ok then VectorSets = VectorSets + 1 end
+            if tostring(Param.Name or "") ~= "" then
+                pcall(function() MID:SetVectorParameterValue(FName(tostring(Param.Name)), Linear) end)
+            end
+        end
+    end
+    return (TextureSets + NameSets + VectorSets) > 0, TextureSets, NameSets, VectorSets
+end
+
+function ArmorSkinRefreshComponent(Component)
+    Component = Unwrap(Component)
+    if not IsValidObject(Component) then return end
+    pcall(function() Component:MarkRenderStateDirty() end)
+    pcall(function() Component:UpdateMaterialInstances() end)
+end
+
+function ArmorSkinCreateMID(Item, Serial)
+    local MID = nil
+    local Errors = {}
+    local Ok, Err = pcall(function()
+        MID = Unwrap(Item.Component:CreateDynamicMaterialInstance(
+            Item.Slot, Item.OriginalMaterial, FName("HCECoopArmorSkin_" .. tostring(Serial))))
+    end)
+    if not Ok then Errors[#Errors + 1] = tostring(Err) end
+    if not IsValidObject(MID) then
+        Ok, Err = pcall(function()
+            MID = Unwrap(Item.Component:CreateAndSetMaterialInstanceDynamicFromMaterial(Item.Slot, Item.OriginalMaterial))
+        end)
+        if not Ok then Errors[#Errors + 1] = tostring(Err) end
+    end
+    return IsValidObject(MID) and MID or nil, table.concat(Errors, " | ")
+end
+
+function ArmorSkinSetTextureOnMID(MID, Params, Texture)
+    MID = Unwrap(MID)
+    Texture = Unwrap(Texture)
+    if not IsValidObject(MID) or not IsValidObject(Texture) then return false, 0 end
+    local Count = 0
+    for _, Param in ipairs(Params or {}) do
+        local Ok, Err = pcall(function() MID:SetTextureParameterValueByInfo(Param.Info, Texture) end)
+        if not Ok then
+            Log("ARMORSKIN texture set failed association=%s index=%s error=%s",
+                SafeToString(Param.Association), SafeToString(Param.Index), tostring(Err))
+            return false, Count
+        end
+        Count = Count + 1
+    end
+    return Count > 0, Count
+end
+
+function ArmorSkinColorLabel(ColorIndex)
+    ColorIndex = tonumber(ColorIndex) or 0
+    if ColorIndex == 0 then return "ORIGINAL GREEN" end
+    local Color = WarthogCEColors[ColorIndex]
+    return Color and tostring(Color.Name) or tostring(ColorIndex)
+end
+
+function ArmorSkinLoadTexture(ColorIndex)
+    ColorIndex = tonumber(ColorIndex)
+    if ColorIndex == nil or ColorIndex < 1 or ColorIndex > #WarthogCEColors then return nil, "invalid color index" end
+    local Color = WarthogCEColors[ColorIndex]
+    local Cached = ArmorSkinTextureCache[Color.Name]
+    if IsValidObject(Cached) then return Cached, nil end
+    local AssetName = "T_HCEChief_Color_" .. tostring(Color.Name)
+    local Path = "/Game/Mods/HCECoopArmor/" .. AssetName
+    local FullPath = Path .. "." .. AssetName
+    local Texture = nil
+    local LastError = "load returned invalid"
+
+    -- Both forms are valid UE object references on the builds tested. Frontend
+    -- LoadAsset accepted the package form; network-client sessions sometimes
+    -- returned an invalid UObject there, so RC3_29 also tries the explicit
+    -- object form before falling back to already-loaded object lookup.
+    for _, CandidatePath in ipairs({ Path, FullPath }) do
+        if not IsValidObject(Texture) then
+            local Ok, Err = pcall(function() Texture = Unwrap(LoadAsset(CandidatePath)) end)
+            if not Ok then LastError = tostring(Err) end
+        end
+    end
+    if not IsValidObject(Texture) then pcall(function() Texture = Unwrap(StaticFindObject(FullPath)) end) end
+    if not IsValidObject(Texture) then pcall(function() Texture = Unwrap(StaticFindObject(Path)) end) end
+    if not IsValidObject(Texture) then
+        return nil, string.format("%s unavailable/not cooked (%s)", AssetName, tostring(LastError))
+    end
+    ArmorSkinTextureCache[Color.Name] = Texture
+    Log("ARMORSKIN VT loaded index=%d color=%s asset=%s", ColorIndex, tostring(Color.Name), SafeFullName(Texture))
+    return Texture, nil
+end
+
+function ArmorSkinFindPersistentGameInstance()
+    local Cached = Unwrap(ArmorSkinTextureKeeperGameInstance)
+    if IsValidObject(Cached) then return Cached end
+
+    local World = nil
+    pcall(function() World = Unwrap(UEHelpers.GetWorldContextObject()) end)
+    local GameInstance = nil
+    if IsValidObject(World) then
+        pcall(function() GameInstance = Unwrap(World:GetGameInstance()) end)
+        if not IsValidObject(GameInstance) then pcall(function() GameInstance = Unwrap(World.OwningGameInstance) end) end
+    end
+    if not IsValidObject(GameInstance) then
+        pcall(function() GameInstance = Unwrap(FindFirstOf("GameInstance")) end)
+    end
+    if not IsValidObject(GameInstance) then
+        local Instances = nil
+        pcall(function() Instances = FindAllOf("HaloOnlineGameInstance") end)
+        for _, Candidate in ipairs(Instances or {}) do
+            Candidate = Unwrap(Candidate)
+            if IsValidObject(Candidate) then GameInstance = Candidate break end
+        end
+    end
+    if IsValidObject(GameInstance) then
+        ArmorSkinTextureKeeperGameInstance = GameInstance
+        return GameInstance
+    end
+    return nil
+end
+
+function ArmorSkinFindKeeperParentMaterial()
+    local Cached = Unwrap(ArmorSkinTextureKeeperParent)
+    if IsValidObject(Cached) then return Cached end
+    local Paths = {
+        "/Game/Characters/Spartans/Default/Materials/MI_Chief_Armor",
+        "/Game/Characters/Spartans/Default/Materials/MI_Chief_Armor.MI_Chief_Armor",
+    }
+    local Parent = nil
+    for _, Path in ipairs(Paths) do
+        if not IsValidObject(Parent) then pcall(function() Parent = Unwrap(LoadAsset(Path)) end) end
+    end
+    if not IsValidObject(Parent) then
+        pcall(function() Parent = Unwrap(StaticFindObject("/Game/Characters/Spartans/Default/Materials/MI_Chief_Armor.MI_Chief_Armor")) end)
+    end
+    if IsValidObject(Parent) then ArmorSkinTextureKeeperParent = Parent return Parent end
+    return nil
+end
+
+function ArmorSkinEnsurePersistentTextureKeeper(ColorIndex, Texture)
+    ColorIndex = tonumber(ColorIndex)
+    Texture = Unwrap(Texture)
+    if ColorIndex == nil or not IsValidObject(Texture) then return false, "texture unavailable" end
+    local Color = WarthogCEColors[ColorIndex]
+    if Color == nil then return false, "invalid color" end
+    local Existing = Unwrap(ArmorSkinTextureKeeperByColor[Color.Name])
+    if IsValidObject(Existing) then return true, "existing" end
+
+    local GameInstance = ArmorSkinFindPersistentGameInstance()
+    if not IsValidObject(GameInstance) then return false, "GameInstance unavailable" end
+    local Parent = ArmorSkinFindKeeperParentMaterial()
+    if not IsValidObject(Parent) then return false, "MI_Chief_Armor unavailable" end
+
+    local MIDClass = Unwrap(ArmorSkinTextureKeeperClass)
+    if not IsValidObject(MIDClass) then
+        pcall(function() MIDClass = Unwrap(StaticFindObject("/Script/Engine.MaterialInstanceDynamic")) end)
+        if IsValidObject(MIDClass) then ArmorSkinTextureKeeperClass = MIDClass end
+    end
+    if not IsValidObject(MIDClass) then return false, "MaterialInstanceDynamic class unavailable" end
+
+    local Keeper = nil
+    local Name = FName("HCEArmorTextureKeeper_" .. tostring(Color.Name))
+    local ConstructErr = ""
+    local Ok, Err = pcall(function()
+        -- Mirrors UE4SS BPML_GenericFunctions' persistent-object pattern:
+        -- GameInstance outer + GarbageCollectionKeepFlags. RF_Standalone is
+        -- added as a second safety net because these keepers live for process life.
+        Keeper = Unwrap(StaticConstructObject(MIDClass, GameInstance, Name, 0x00000042, 0x0E000000,
+            false, false, nil, nil, nil))
+    end)
+    if not Ok then ConstructErr = tostring(Err) end
+    if not IsValidObject(Keeper) then return false, "keeper construct failed: " .. ConstructErr end
+
+    local ParentOk = pcall(function() Keeper.Parent = Parent end)
+    local SetOk, SetErr = pcall(function() Keeper:SetTextureParameterValue(FName("Diffuse Map"), Texture) end)
+    if not SetOk then
+        -- Some UE builds accept a string/FName wrapper differently; keep this
+        -- bounded fallback rather than failing the whole network feature.
+        SetOk, SetErr = pcall(function() Keeper:SetTextureParameterValue("Diffuse Map", Texture) end)
+    end
+    if not SetOk then
+        return false, string.format("keeper texture bind failed parentSet=%s error=%s", tostring(ParentOk), tostring(SetErr))
+    end
+
+    ArmorSkinTextureKeeperByColor[Color.Name] = Keeper
+    return true, "created"
+end
+
+function ArmorSkinTexturePrewarmPass(Source)
+    local Loaded, Failed, Kept, KeeperFailed = 0, 0, 0, 0
+    local FailureText = {}
+    for Index = 1, #WarthogCEColors do
+        local Texture, Err = ArmorSkinLoadTexture(Index)
+        if IsValidObject(Texture) then
+            Loaded = Loaded + 1
+            local KeepOk, KeepInfo = ArmorSkinEnsurePersistentTextureKeeper(Index, Texture)
+            if KeepOk then
+                Kept = Kept + 1
+            else
+                KeeperFailed = KeeperFailed + 1
+                if #FailureText < 4 then FailureText[#FailureText + 1] = ArmorSkinColorLabel(Index) .. ":" .. tostring(KeepInfo) end
+            end
+        else
+            Failed = Failed + 1
+            if #FailureText < 4 then FailureText[#FailureText + 1] = ArmorSkinColorLabel(Index) .. ":" .. tostring(Err) end
+        end
+    end
+    ArmorSkinTexturePrewarmComplete = Loaded == #WarthogCEColors and Kept == #WarthogCEColors
+    Log("ARMORSKIN texture prewarm source=%s loaded=%d failed=%d kept=%d keeperFailed=%d complete=%s detail=%s",
+        tostring(Source or "prewarm"), Loaded, Failed, Kept, KeeperFailed,
+        tostring(ArmorSkinTexturePrewarmComplete == true), table.concat(FailureText, " | "))
+    return ArmorSkinTexturePrewarmComplete == true
+end
+
+function ArmorSkinScheduleTexturePrewarm(Source)
+    ArmorSkinTexturePrewarmToken = (tonumber(ArmorSkinTexturePrewarmToken) or 0) + 1
+    local Token = ArmorSkinTexturePrewarmToken
+    local Generation = ModTravelGeneration
+    for _, DelayMs in ipairs({ 250, 900, 1800, 3200 }) do
+        local ThisDelay = DelayMs
+        ExecuteInGameThreadWithDelay(ThisDelay, function()
+            if ModTeardownGuard or Token ~= ArmorSkinTexturePrewarmToken or Generation ~= ModTravelGeneration then return end
+            if ArmorSkinTexturePrewarmComplete == true then return end
+            if ArmorSkinTexturePrewarmPass(string.format("%s +%dms", tostring(Source or "frontend"), ThisDelay)) then
+                ArmorSkinTexturePrewarmToken = Token + 1
+            end
+        end)
+    end
+end
+
+function ArmorSkinArmFrontendTexturePrewarm(Source)
+    if ArmorSkinTexturePrewarmComplete == true then return true end
+    if CurrentWorldSessionKind() ~= "frontend" then return false end
+    local Generation = ModTravelGeneration
+    if tonumber(ArmorSkinTexturePrewarmRequestedGeneration) == tonumber(Generation) then return false end
+    ArmorSkinTexturePrewarmRequestedGeneration = Generation
+
+    -- The frontend BP LogicMod actors are created just before the squad widget
+    -- becomes usable. Wait a tiny amount so HCECoopArmor is fully registered,
+    -- then execute an immediate pass rather than relying on startup timers.
+    ExecuteInGameThreadWithDelay(120, function()
+        if Generation ~= ModTravelGeneration or CurrentWorldSessionKind() ~= "frontend" then return end
+        if ModTeardownGuard then
+            -- Post-load guard normally releases within this window. The regular
+            -- bounded scheduler provides the retry path once it does.
+            ArmorSkinScheduleTexturePrewarm(tostring(Source or "frontend signal") .. " guard-wait")
+            return
+        end
+        if ArmorSkinTexturePrewarmPass(tostring(Source or "frontend signal") .. " immediate") then return end
+        ArmorSkinScheduleTexturePrewarm(tostring(Source or "frontend signal") .. " retry")
+    end)
+    Log("ARMORSKIN texture prewarm ARMED source=%s generation=%d", tostring(Source or "frontend signal"), tonumber(Generation) or -1)
+    return true
+end
+
+function ArmorSkinObjectDescriptionForDetection(Object)
+    Object = Unwrap(Object)
+    if not IsValidObject(Object) then return "" end
+    local Full = tostring(SafeFullName(Object) or "")
+    local ClassFull = ""
+    pcall(function()
+        local Class = Object:GetClass()
+        if IsValidObject(Class) then ClassFull = tostring(SafeFullName(Class) or "") end
+    end)
+    return Full .. " | class=" .. ClassFull
+end
+
+function ArmorSkinObjectLooksLikeWeapon(Object)
+    local Lower = string.lower(ArmorSkinObjectDescriptionForDetection(Object))
+    return string.find(Lower, "weaponactor", 1, true) ~= nil
+        or (string.find(Lower, "bp_fp_", 1, true) ~= nil and string.find(Lower, "weapon", 1, true) ~= nil)
+end
+
+function ArmorSkinFirstPersonCandidates(Pawn)
+    Pawn = Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return {}, "pawn unavailable" end
+    local Out, Seen, Routes = {}, {}, {}
+
+    local function Add(Object, Route)
+        Object = Unwrap(Object)
+        if not IsValidObject(Object) or ArmorSkinObjectLooksLikeWeapon(Object) then return end
+        local Key = ArmorSkinObjectKey(Object) or ArmorSkinObjectDescriptionForDetection(Object)
+        if Key == nil or Key == "" or Seen[Key] then return end
+        Seen[Key] = true
+        Out[#Out + 1] = Object
+        Routes[#Routes + 1] = tostring(Route or "candidate")
+    end
+
+    -- Preferred route when this property is reflected correctly.
+    local Direct = nil
+    pcall(function() Direct = Unwrap(Pawn.FirstPersonArmsSkeletalMesh) end)
+    if IsValidObject(Direct) then Add(Direct, "Pawn.FirstPersonArmsSkeletalMesh") end
+
+    -- RC3_24 critical fallback: enumerate pawn components even when the direct
+    -- property is unavailable. The weapon-skin detector already proved this
+    -- class-description route is safe for Halo's CVW first-person components.
+    local Components = WarthogGetActorComponents(Pawn) or {}
+    for I, RawComponent in ipairs(Components) do
+        if I > 96 then break end
+        local Component = Unwrap(RawComponent)
+        if IsValidObject(Component) then
+            local Lower = string.lower(ArmorSkinObjectDescriptionForDetection(Component))
+            local IsFpArms = string.find(Lower, "bpc_fp_skeletalmesh_c", 1, true) ~= nil
+                or string.find(Lower, "firstpersonarmsskeletalmesh", 1, true) ~= nil
+            if IsFpArms then Add(Component, string.format("PawnComponents[%d]", I)) end
+        end
+    end
+
+    -- Last bounded recovery for builds where GetComponentsByClass omits the CVW
+    -- wrapper but UE4SS still publishes BPC_FP_SkeletalMesh_C globally. Require
+    -- the same pawn instance path so P1/P2 can never cross-wire their arms.
+    if #Out == 0 then
+        local PawnName = string.lower(tostring(SafeFullName(Pawn) or ""))
+        local Candidates = nil
+        pcall(function() Candidates = FindAllOf("BPC_FP_SkeletalMesh_C") end)
+        for I, RawCandidate in ipairs(ArrayValues(Candidates)) do
+            if I > 32 then break end
+            local Candidate = Unwrap(RawCandidate)
+            local Full = string.lower(tostring(SafeFullName(Candidate) or ""))
+            if IsValidObject(Candidate) and PawnName ~= "" and string.find(Full, PawnName, 1, true) ~= nil then
+                Add(Candidate, string.format("FindAllOf.BPC_FP_SkeletalMesh_C[%d]", I))
+            end
+        end
+    end
+
+    if #Out == 0 then
+        local Components = WarthogGetActorComponents(Pawn) or {}
+        local Hints = {}
+        for I, RawComponent in ipairs(Components) do
+            if I > 96 or #Hints >= 8 then break end
+            local Component = Unwrap(RawComponent)
+            if IsValidObject(Component) then
+                local Desc = ArmorSkinObjectDescriptionForDetection(Component)
+                local Lower = string.lower(Desc)
+                if string.find(Lower, "/game/blueprints/cvw/", 1, true) ~= nil
+                    or string.find(Lower, "bpc_fp_", 1, true) ~= nil
+                    or string.find(Lower, "firstperson", 1, true) ~= nil then
+                    Hints[#Hints + 1] = string.format("[%d]%s", I, Desc)
+                end
+            end
+        end
+        if #Hints > 0 then
+            local Joined = table.concat(Hints, " ; ")
+            if #Joined > 1800 then Joined = string.sub(Joined, 1, 1800) .. "..." end
+            Log("ARMORSKIN first-person discovery hints=%s", Joined)
+        end
+    end
+    return Out, (#Routes > 0 and table.concat(Routes, ",") or "unavailable")
+end
+
+function ArmorSkinFirstPersonAnchor(Pawn)
+    local Candidates, Route = ArmorSkinFirstPersonCandidates(Pawn)
+    local Arms = Unwrap(Candidates[1])
+    if not IsValidObject(Arms) then return nil, nil, Route end
+    return Arms, ArmorSkinObjectKey(Arms), Route
+end
+
+function ArmorSkinAppendMatchingSlots(Object, Scope, Slots, Seen, ExplicitArmsObject)
+    Object = Unwrap(Object)
+    if not IsValidObject(Object) then return 0 end
+    local Added = 0
+    local ComponentName = SafeFullName(Object) or ""
+    local SafeExplicitArms = ExplicitArmsObject == true and not ArmorSkinObjectLooksLikeWeapon(Object)
+    for _, SlotEntry in ipairs(ArmorSkinGetMaterialSlots(Object)) do
+        local MaterialName = SafeFullName(SlotEntry.Material) or ""
+        local LowerMaterialName = string.lower(MaterialName)
+        local IsChiefArmor = string.find(LowerMaterialName, "mi_chief_armor", 1, true) ~= nil
+        local IsChiefArms = string.find(LowerMaterialName, "chief", 1, true) ~= nil
+            and (string.find(LowerMaterialName, "armor", 1, true) ~= nil
+                or string.find(LowerMaterialName, "arms", 1, true) ~= nil
+                or string.find(LowerMaterialName, "hand", 1, true) ~= nil)
+        local IsChiefViaParent = false
+        if not SafeExplicitArms then
+            pcall(function() IsChiefViaParent = ArmorSkinMaterialLooksLikeChief(SlotEntry.Material) == true end)
+        end
+
+        -- The explicit first-person arms object is allowed to use a generic or
+        -- dynamic material name. Weapon actors are excluded before this point,
+        -- and the later Diffuse Map parameter gate must still match before a MID
+        -- can be created. Third-person components keep the strict Chief filter.
+        if IsChiefArmor or IsChiefArms or IsChiefViaParent or SafeExplicitArms then
+            local Key = ComponentName .. "|" .. tostring(SlotEntry.Slot)
+            if not Seen[Key] then
+                Seen[Key] = true
+                Slots[#Slots + 1] = {
+                    Component = Object,
+                    ComponentName = ComponentName,
+                    Slot = SlotEntry.Slot,
+                    OriginalMaterial = SlotEntry.Material,
+                    Scope = Scope,
+                }
+                Added = Added + 1
+            end
+        end
+    end
+    return Added
+end
+
+-- RC3_33 crash-safe remote visual resolver.
+-- RC3_32 proved that global FindAllOf(SkeletalMeshComponent/StaticMeshComponent)
+-- on the game thread can stall WinGDK hard. This route never performs a global
+-- mesh scan. It only walks objects already attached to the exact replicated pawn.
+function ArmorSkinMaterialLooksLikeChief(Material)
+    Material = Unwrap(Material)
+    if not IsValidObject(Material) then return false end
+    local Current, Seen = Material, {}
+    for _ = 1, 8 do
+        if not IsValidObject(Current) then break end
+        local Full = tostring(SafeFullName(Current) or "")
+        if Full == "" or Seen[Full] then break end
+        Seen[Full] = true
+        local Lower = string.lower(Full)
+        if string.find(Lower, "mi_chief_armor", 1, true) ~= nil
+            or (string.find(Lower, "/characters/spartans/default/", 1, true) ~= nil
+                and (string.find(Lower, "armor", 1, true) ~= nil or string.find(Lower, "chief", 1, true) ~= nil)) then
+            return true
+        end
+        local Values = nil
+        pcall(function() Values = Current.TextureParameterValues end)
+        for _, RawEntry in ipairs(ArrayValues(Values)) do
+            local Entry = Unwrap(RawEntry)
+            local Texture = nil
+            pcall(function() Texture = Unwrap(Entry.ParameterValue) end)
+            local T = string.lower(tostring(SafeFullName(Texture) or ""))
+            if string.find(T, "t_spartans_default_armor_d", 1, true) ~= nil then return true end
+        end
+        Current = WarthogMaterialParent(Current)
+    end
+    return false
+end
+
+function ArmorSkinAppendRemoteAttachedSlots(Object, Scope, Slots, Seen)
+    Object = Unwrap(Object)
+    if not IsValidObject(Object) or ArmorSkinObjectLooksLikeWeapon(Object) then return 0 end
+    local Desc = string.lower(ArmorSkinObjectDescriptionForDetection(Object))
+    if string.find(Desc, "firstperson", 1, true) ~= nil or string.find(Desc, "bpc_fp_", 1, true) ~= nil then return 0 end
+    local OnlyOwner = false
+    pcall(function() OnlyOwner = Object.bOnlyOwnerSee == true end)
+    if OnlyOwner then return 0 end
+    local Added = 0
+    local ComponentName = tostring(SafeFullName(Object) or "")
+    for _, SlotEntry in ipairs(ArmorSkinGetMaterialSlots(Object)) do
+        if ArmorSkinMaterialLooksLikeChief(SlotEntry.Material) then
+            local Params = ArmorSkinFindDiffuseParams(SlotEntry.Material)
+            if Params ~= nil then
+                local K = ComponentName .. "|" .. tostring(SlotEntry.Slot)
+                if not Seen[K] then
+                    Seen[K] = true
+                    Slots[#Slots+1] = {
+                        Component=Object, ComponentName=ComponentName, Slot=SlotEntry.Slot,
+                        OriginalMaterial=SlotEntry.Material, Scope=Scope,
+                    }
+                    Added = Added + 1
+                end
+            end
+        end
+    end
+    return Added
+end
+
+function ArmorSkinAppendCrashSafeRemoteVisuals(Pawn, Slots, Seen)
+    Pawn = Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return 0, "invalid-pawn" end
+    local Queue, SeenObj, Audit = {}, {}, {}
+    local function Add(Object, Route)
+        Object = Unwrap(Object)
+        if not IsValidObject(Object) or ArmorSkinSameObject(Object, Pawn) then return end
+        local K = ArmorSkinObjectKey(Object) or tostring(SafeFullName(Object) or "")
+        if K == "" or SeenObj[K] then return end
+        SeenObj[K] = true
+        if #Queue < 96 then Queue[#Queue+1] = {Object=Object, Route=Route} end
+    end
+
+    -- Actor-level children/attachments if the engine exposes them.
+    local Values = nil
+    pcall(function() Values = Pawn.Children end)
+    for I,V in ipairs(ArrayValues(Values)) do if I > 24 then break end; Add(V, "Pawn.Children") end
+    Values = nil
+    pcall(function() Values = Pawn:GetAttachedActors() end)
+    for I,V in ipairs(ArrayValues(Values)) do if I > 24 then break end; Add(V, "Pawn.GetAttachedActors") end
+    Values = nil
+    pcall(function() Values = Pawn.AttachedActors end)
+    for I,V in ipairs(ArrayValues(Values)) do if I > 24 then break end; Add(V, "Pawn.AttachedActors") end
+
+    -- Component tree: this is bounded to components already owned by Pawn.
+    local Components = WarthogGetActorComponents(Pawn) or {}
+    for I,Raw in ipairs(Components) do
+        if I > 96 then break end
+        local C = Unwrap(Raw)
+        if IsValidObject(C) then
+            Add(C, "Pawn.Component")
+            local ChildActor = nil
+            pcall(function() ChildActor = Unwrap(C:GetChildActor()) end)
+            if not IsValidObject(ChildActor) then pcall(function() ChildActor = Unwrap(C.ChildActor) end) end
+            Add(ChildActor, "Pawn.Component.ChildActor")
+            local Children = nil
+            pcall(function() Children = C.AttachChildren end)
+            for J,RawChild in ipairs(ArrayValues(Children)) do
+                if J > 24 then break end
+                local CC = Unwrap(RawChild)
+                Add(CC, "Pawn.Component.AttachChild")
+                local Owner = nil
+                pcall(function() Owner = Unwrap(CC:GetOwner()) end)
+                Add(Owner, "Pawn.Component.AttachChild.Owner")
+            end
+        end
+    end
+
+    -- A few likely direct properties are cheap to probe and are protected by pcall.
+    for _,Name in ipairs({"Mesh","Body","CharacterMesh","ThirdPersonMesh","Biped","BipedActor","ThirdPersonActor","SkeletalMeshComponent"}) do
+        local V=nil; pcall(function() V=Unwrap(Pawn[Name]) end); Add(V, "Pawn."..Name)
+    end
+
+    local Added = 0
+    for I,Item in ipairs(Queue) do
+        if I > 96 then break end
+        local O = Unwrap(Item.Object)
+        if IsValidObject(O) and not ArmorSkinObjectLooksLikeWeapon(O) then
+            Added = Added + ArmorSkinAppendRemoteAttachedSlots(O, "third-person-remote-attached", Slots, Seen)
+            local Sub = WarthogGetActorComponents(O) or {}
+            for J,SC in ipairs(Sub) do
+                if J > 64 then break end
+                Added = Added + ArmorSkinAppendRemoteAttachedSlots(SC, "third-person-remote-attached-component", Slots, Seen)
+            end
+            if #Audit < 16 then
+                local Mats = #ArmorSkinGetMaterialSlots(O)
+                Audit[#Audit+1] = string.format("%s route=%s mats=%d", tostring(SafeFullName(O) or "?"), tostring(Item.Route), Mats)
+            end
+        end
+    end
+
+    local PawnKey = ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+    if Added > 0 then
+        Log("ARMORSKIN remote attached visual resolved pawn=%s slots=%d candidates=%d",
+            tostring(SafeFullName(Pawn) or Pawn), Added, #Queue)
+        return Added, "pawn-attached-visual"
+    end
+    if not ArmorSkinRemoteAttachedAuditLogged[PawnKey] then
+        ArmorSkinRemoteAttachedAuditLogged[PawnKey] = true
+        local D = table.concat(Audit, " | ")
+        if #D > 2600 then D = string.sub(D,1,2600).."..." end
+        Log("ARMORSKIN remote attached visual unresolved pawn=%s candidates=%d audit=%s",
+            tostring(SafeFullName(Pawn) or Pawn), #Queue, D)
+    end
+    return 0, "pawn-attached-visual-unresolved"
+end
+
+-- RC3_34: learn the exact UClass(es) that carry Chief third-person armor on
+-- the local player, then scan ONLY those exact classes for observer-side peers.
+-- This is safer and more precise than assuming a particular generated mesh class.
+function ArmorSkinCacheChiefPresentationClass(Component, Source)
+    Component=Unwrap(Component)
+    if not IsValidObject(Component) then return false end
+    local C=nil
+    pcall(function() C=Unwrap(Component:GetClass()) end)
+    if not IsValidObject(C) then return false end
+    local K=ArmorSkinObjectKey(C) or tostring(SafeFullName(C) or "")
+    if K=="" then return false end
+    local KL=string.lower(K)
+    -- Never promote native generic mesh base classes into a world scan. RC3_32
+    -- proved those pools are unsafe on WinGDK. Blueprint/specialized subclasses
+    -- such as BPC_SkeletalMesh_C are the intended candidates.
+    if string.find(KL,"/script/engine.skeletalmeshcomponent",1,true)
+        or string.find(KL,"/script/engine.staticmeshcomponent",1,true)
+        or string.find(KL,"/script/engine.meshcomponent",1,true) then
+        return false
+    end
+    if ArmorSkinChiefPresentationClassSeen[K] then return true end
+    ArmorSkinChiefPresentationClassSeen[K]=true
+    if #ArmorSkinChiefPresentationClasses<12 then
+        ArmorSkinChiefPresentationClasses[#ArmorSkinChiefPresentationClasses+1]={Class=C,Name=K,Source=tostring(Source or "local-chief")}
+        Log("ARMORSKIN learned Chief presentation UClass class=%s source=%s",K,tostring(Source or "local-chief"))
+    end
+    return true
+end
+
+function ArmorSkinSeedChiefPresentationClassesFromLocalPlayers()
+    if #ArmorSkinChiefPresentationClasses>0 then return #ArmorSkinChiefPresentationClasses end
+    for PlayerIndex=1,2 do
+        local Pawn=ArmorSkinGetPawnFromController(GetPlayer(PlayerIndex))
+        if IsValidObject(Pawn) then
+            local Biped=ArmorSkinFindThirdPersonBiped(Pawn)
+            if IsValidObject(Biped) then
+                for I,C in ipairs(WarthogGetActorComponents(Biped) or {}) do
+                    if I>128 then break end
+                    local HasChief=false
+                    for _,S in ipairs(ArmorSkinGetMaterialSlots(C)) do
+                        if ArmorSkinMaterialLooksLikeChief(S.Material) then HasChief=true; break end
+                    end
+                    if HasChief then
+                        ArmorSkinCacheChiefPresentationClass(C,string.format("local P%d biped",PlayerIndex))
+                    end
+                end
+            end
+        end
+    end
+    return #ArmorSkinChiefPresentationClasses
+end
+
+function ArmorSkinAppendExactChiefClassRemoteVisuals(Pawn, Slots, Seen)
+    Pawn=Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return 0,"invalid-pawn" end
+    ArmorSkinSeedChiefPresentationClassesFromLocalPlayers()
+    local Added,Matched,CandidateCount=0,0,0
+    local Audit={}
+    local PawnName=tostring(SafeFullName(Pawn) or "")
+    for ClassIndex,Entry in ipairs(ArmorSkinChiefPresentationClasses or {}) do
+        if ClassIndex>12 then break end
+        local CClass=Unwrap(Entry.Class)
+        if IsValidObject(CClass) then
+            local ShortClass=ArmorSkinClassShortName(CClass,nil)
+            local Found=ArmorSkinTargetedFindObjects(CClass,ShortClass,256)
+            for I,Raw in ipairs(Found) do
+                if I>256 then break end
+                local O=Unwrap(Raw)
+                if IsValidObject(O) and not ArmorSkinObjectLooksLikeWeapon(O) then
+                    local ON=tostring(SafeFullName(O) or "")
+                    local SameWorld=ArmorSkinSharesRuntimeWorld(O,Pawn)
+                    if SameWorld then
+                        local HasChief=false
+                        for _,S in ipairs(ArmorSkinGetMaterialSlots(O)) do
+                            if ArmorSkinMaterialLooksLikeChief(S.Material) then HasChief=true; break end
+                        end
+                        if HasChief then
+                            CandidateCount=CandidateCount+1
+                            local Linked,LinkRoute=ArmorSkinObjectChainReachesPawn(O,Pawn)
+                            local Match,Dist,Why=false,nil,"not-spatial"
+                            if Linked then Match=true; Why="linked-"..tostring(LinkRoute)
+                            else Match,Dist,Why=ArmorSkinSpatialCandidateMatchesPawn(O,Pawn) end
+                            if Match then
+                                local N=ArmorSkinAppendRemoteAttachedSlots(O,"third-person-remote-exact-chief-class",Slots,Seen)
+                                if N>0 then Added=Added+N; Matched=Matched+1 end
+                                if #Audit<16 then
+                                    Audit[#Audit+1]=string.format("MATCH class=%s obj=%s slots=%d dist=%s why=%s",tostring(Entry.Name),ON,N,Dist and string.format("%.1f",Dist) or "-",tostring(Why))
+                                end
+                            elseif #Audit<16 then
+                                Audit[#Audit+1]=string.format("skip class=%s obj=%s dist=%s why=%s",tostring(Entry.Name),ON,Dist and string.format("%.1f",Dist) or "-",tostring(Why))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local Key=ArmorSkinObjectKey(Pawn) or PawnName
+    if Added>0 then
+        Log("ARMORSKIN remote exact Chief-class visual resolved pawn=%s slots=%d matchedComponents=%d candidates=%d classes=%d detail=%s",
+            PawnName,Added,Matched,CandidateCount,#ArmorSkinChiefPresentationClasses,table.concat(Audit," | "))
+        return Added,"exact-chief-presentation-class"
+    end
+    if not ArmorSkinSyncReflectionAuditLogged["chiefclass:"..Key] then
+        ArmorSkinSyncReflectionAuditLogged["chiefclass:"..Key]=true
+        local D=table.concat(Audit," | ")
+        if #D>3600 then D=string.sub(D,1,3600).."..." end
+        Log("ARMORSKIN remote exact Chief-class visual unresolved pawn=%s candidates=%d classes=%d detail=%s",PawnName,CandidateCount,#ArmorSkinChiefPresentationClasses,D)
+    end
+    return 0,"exact-chief-class-unresolved"
+end
+
+-- RC3_34: event-driven cache of the actual CVW skeletal presentation components.
+-- Campaign Evolved's BlamMeshSynchronization RuntimeRegions spawn skeletal
+-- geometry through /Game/Blueprints/CVW/BPC_SkeletalMesh. This specific-class
+-- cache lets remote armor target those generated components without touching
+-- the global SkeletalMeshComponent pool.
+function ArmorSkinCacheCVWSkeletal(Component, Source)
+    Component=Unwrap(Component)
+    if not IsValidObject(Component) then return false end
+    local Full=tostring(SafeFullName(Component) or "")
+    if not ArmorSkinContainsCI(Full,"BPC_SkeletalMesh_C") or string.find(Full,"Default__",1,true) then return false end
+    local Key=ArmorSkinObjectKey(Component) or Full
+    if Key=="" then return false end
+    if not ArmorSkinCVWSkeletalSeen[Key] then
+        ArmorSkinCVWSkeletalSeen[Key]=true
+        if #ArmorSkinCVWSkeletalCache < 512 then ArmorSkinCVWSkeletalCache[#ArmorSkinCVWSkeletalCache+1]=Component end
+    end
+    if not IsValidObject(ArmorSkinCVWSkeletalClass) then
+        local C=nil; pcall(function() C=Unwrap(Component:GetClass()) end)
+        if IsValidObject(C) then ArmorSkinCVWSkeletalClass=C end
+    end
+    return true
+end
+
+function ArmorSkinEnsureCVWSkeletalClass()
+    if IsValidObject(ArmorSkinCVWSkeletalClass) then return ArmorSkinCVWSkeletalClass end
+    local C=nil
+    pcall(function() C=Unwrap(StaticFindObject("/Game/Blueprints/CVW/BPC_SkeletalMesh.BPC_SkeletalMesh_C")) end)
+    if IsValidObject(C) then ArmorSkinCVWSkeletalClass=C; return C end
+    return nil
+end
+
+function ArmorSkinSeedCVWSkeletalCache()
+    if not ArmorSkinCVWConstructionListenerReady then pcall(RegisterArmorSkinCVWConstructionListener) end
+    if tonumber(ArmorSkinCVWExactScanGeneration)==tonumber(WarthogColorRuntimeGeneration) then return end
+    ArmorSkinCVWExactScanGeneration=tonumber(WarthogColorRuntimeGeneration) or 0
+    local C=ArmorSkinEnsureCVWSkeletalClass()
+    local Found=ArmorSkinTargetedFindObjects(C,"BPC_SkeletalMesh_C",256)
+    for _,O in ipairs(Found) do ArmorSkinCacheCVWSkeletal(O,"exact CVW class seed") end
+    Log("ARMORSKIN CVW exact-class seed generation=%d found=%d cached=%d class=%s",
+        tonumber(WarthogColorRuntimeGeneration) or 0,#Found,#ArmorSkinCVWSkeletalCache,tostring(SafeFullName(C) or "unavailable"))
+end
+
+function ArmorSkinRemoteCandidateDebug(Object)
+    Object=Unwrap(Object); if not IsValidObject(Object) then return "invalid" end
+    local Owner,Outer,Parent=nil,nil,nil
+    pcall(function() Owner=Unwrap(Object:GetOwner()) end)
+    pcall(function() Outer=Unwrap(Object:GetOuter()) end)
+    pcall(function() Parent=Unwrap(Object:GetAttachParent()) end)
+    return string.format("owner=%s outer=%s parent=%s",tostring(SafeFullName(Owner) or "-"),tostring(SafeFullName(Outer) or "-"),tostring(SafeFullName(Parent) or "-"))
+end
+
+function ArmorSkinAppendCVWRemoteVisuals(Pawn, Slots, Seen)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return 0,"invalid-pawn" end
+    ArmorSkinSeedCVWSkeletalCache()
+    local Added,ChiefCandidates,Matched=0,0,0
+    local Audit={}
+    local PawnName=tostring(SafeFullName(Pawn) or "")
+    for I,Raw in ipairs(ArmorSkinCVWSkeletalCache or {}) do
+        if I > 512 then break end
+        local C=Unwrap(Raw)
+        if IsValidObject(C) and not ArmorSkinObjectLooksLikeWeapon(C) then
+            local CN=tostring(SafeFullName(C) or "")
+            local SameWorld=ArmorSkinSharesRuntimeWorld(C,Pawn)
+            if SameWorld then
+                local HasChief=false
+                for _,S in ipairs(ArmorSkinGetMaterialSlots(C)) do
+                    if ArmorSkinMaterialLooksLikeChief(S.Material) then HasChief=true; break end
+                end
+                if HasChief then
+                    ChiefCandidates=ChiefCandidates+1
+                    local Linked,LinkRoute=ArmorSkinObjectChainReachesPawn(C,Pawn)
+                    local Match,Dist,Why=false,nil,"not-spatial"
+                    if Linked then Match=true; Why="linked-"..tostring(LinkRoute)
+                    else Match,Dist,Why=ArmorSkinSpatialCandidateMatchesPawn(C,Pawn) end
+                    if Match then
+                        local N=ArmorSkinAppendRemoteAttachedSlots(C,"third-person-remote-cvw",Slots,Seen)
+                        if N>0 then Added=Added+N; Matched=Matched+1 end
+                        if #Audit<12 then Audit[#Audit+1]=string.format("MATCH %s slots=%d dist=%s why=%s %s",CN,N,Dist and string.format("%.1f",Dist) or "-",tostring(Why),ArmorSkinRemoteCandidateDebug(C)) end
+                    elseif #Audit<12 then
+                        Audit[#Audit+1]=string.format("skip %s dist=%s why=%s %s",CN,Dist and string.format("%.1f",Dist) or "-",tostring(Why),ArmorSkinRemoteCandidateDebug(C))
+                    end
+                end
+            end
+        end
+    end
+    local Key=ArmorSkinObjectKey(Pawn) or PawnName
+    if Added>0 then
+        Log("ARMORSKIN remote CVW visual resolved pawn=%s slots=%d matchedComponents=%d chiefCandidates=%d cached=%d detail=%s",
+            PawnName,Added,Matched,ChiefCandidates,#ArmorSkinCVWSkeletalCache,table.concat(Audit," | "))
+        return Added,"cvw-bpc-skeletal"
+    end
+    if not ArmorSkinSyncReflectionAuditLogged["cvw:"..Key] then
+        ArmorSkinSyncReflectionAuditLogged["cvw:"..Key]=true
+        local D=table.concat(Audit," | "); if #D>3200 then D=string.sub(D,1,3200).."..." end
+        Log("ARMORSKIN remote CVW visual unresolved pawn=%s chiefCandidates=%d cached=%d detail=%s",PawnName,ChiefCandidates,#ArmorSkinCVWSkeletalCache,D)
+    end
+    return 0,"cvw-unresolved"
+end
+
+function ArmorSkinPropertyMeta(Property)
+    Property=Unwrap(Property)
+    if Property==nil then return "","" end
+    local Name,TypeName="",""
+    pcall(function() Name=Property:GetFName():ToString() end)
+    pcall(function()
+        local C=Unwrap(Property:GetClass())
+        if C~=nil then TypeName=C:GetFName():ToString() end
+    end)
+    return tostring(Name or ""),tostring(TypeName or "")
+end
+
+function ArmorSkinReflectionInterestingName(Name)
+    local L=string.lower(tostring(Name or ""))
+    for _,Needle in ipairs({"mesh","component","actor","visual","render","spawn","generated","instance","active","current","body","biped","child","sync"}) do
+        if string.find(L,Needle,1,true) then return true end
+    end
+    return false
+end
+
+function ArmorSkinAppendReflectedSyncVisuals(Pawn, Slots, Seen)
+    Pawn=Unwrap(Pawn); if not IsValidObject(Pawn) then return 0,"invalid-pawn" end
+    local Queue,ObjSeen,Audit,FunctionAudit={}, {}, {}, {}
+    local function Add(O,Route)
+        O=Unwrap(O); if not IsValidObject(O) or ArmorSkinSameObject(O,Pawn) then return end
+        local K=ArmorSkinObjectKey(O) or tostring(SafeFullName(O) or "")
+        if K=="" or ObjSeen[K] or #Queue>=128 then return end
+        ObjSeen[K]=true; Queue[#Queue+1]={Object=O,Route=Route,Depth=0}
+    end
+
+    -- Start ONLY from the synchronization/presentation components already owned
+    -- by this exact pawn. The latest network audit proved these exist remotely.
+    for I,Raw in ipairs(WarthogGetActorComponents(Pawn) or {}) do
+        if I>128 then break end
+        local O=Unwrap(Raw); local D=string.lower(tostring(SafeFullName(O) or ""))
+        if string.find(D,"mesh synchronization",1,true) or string.find(D,"meshsynchronization",1,true)
+            or string.find(D,"skeletonsynchronization",1,true) or string.find(D,"haloassetgroup",1,true) then
+            Add(O,"pawn-sync-component")
+        end
+    end
+
+    local Seeds=#Queue
+    for Q=1,math.min(#Queue,16) do
+        local Item=Queue[Q]; local O=Unwrap(Item.Object)
+        if IsValidObject(O) then
+            local Class=nil; pcall(function() Class=Unwrap(O:GetClass()) end)
+            local ClassDepth,Props=0,0
+            while IsValidObject(Class) and ClassDepth<5 and Props<160 do
+                ClassDepth=ClassDepth+1
+                pcall(function()
+                    Class:ForEachProperty(function(P)
+                        if Props>=160 then return true end
+                        Props=Props+1
+                        local PN,PT=ArmorSkinPropertyMeta(P)
+                        local PNLower=string.lower(PN); local PTLower=string.lower(PT)
+                        if #Audit<90 then Audit[#Audit+1]=string.format("%s:%s",PN,PT) end
+                        local ObjectLike=string.find(PTLower,"objectproperty",1,true)~=nil
+                            or string.find(PTLower,"weakobjectproperty",1,true)~=nil
+                            or string.find(PTLower,"arrayproperty",1,true)~=nil
+                            or string.find(PTLower,"mapproperty",1,true)~=nil
+                            or string.find(PTLower,"setproperty",1,true)~=nil
+                        local Interesting=ArmorSkinReflectionInterestingName(PN)
+                        -- RuntimeRegions is authoring/config data and can be huge; do
+                        -- not traverse it. We want runtime object references only.
+                        if ObjectLike and Interesting and PNLower~="runtimeregions" and not string.find(PNLower,"materialoverrides",1,true) then
+                            local V=nil; pcall(function() V=O:GetPropertyValue(PN) end)
+                            local Direct=Unwrap(V)
+                            if IsValidObject(Direct) then Add(Direct,"reflection."..PN) end
+                            local N=0
+                            for _,Elem in ipairs(ArrayValues(V)) do
+                                N=N+1; if N>32 then break end
+                                local E=Unwrap(Elem); if IsValidObject(E) then Add(E,"reflection."..PN.."[]") end
+                            end
+                            pcall(function()
+                                V:ForEach(function(A,B)
+                                    if N>=48 then return true end
+                                    N=N+1
+                                    local EV=B or A
+                                    EV=Unwrap(EV)
+                                    if IsValidObject(EV) then Add(EV,"reflection."..PN.."{}") end
+                                    return false
+                                end)
+                            end)
+                        end
+                        return false
+                    end)
+                end)
+                local Super=nil; pcall(function() Super=Unwrap(Class:GetSuperStruct()) end)
+                if not IsValidObject(Super) or ArmorSkinSameObject(Super,Class) then break end
+                Class=Super
+            end
+            -- Functions are logged only; no unknown game function is invoked.
+            if Q<=4 then
+                local C=nil; pcall(function() C=Unwrap(O:GetClass()) end)
+                if IsValidObject(C) then pcall(function()
+                    C:ForEachFunction(function(F)
+                        local FN=""; pcall(function() FN=F:GetFName():ToString() end)
+                        if ArmorSkinReflectionInterestingName(FN) and #FunctionAudit<40 then FunctionAudit[#FunctionAudit+1]=FN end
+                        return false
+                    end)
+                end) end
+            end
+        end
+    end
+
+    local Added=0
+    for I,Item in ipairs(Queue) do
+        if I>128 then break end
+        local O=Unwrap(Item.Object)
+        if IsValidObject(O) and not ArmorSkinObjectLooksLikeWeapon(O) then
+            local Linked=select(1,ArmorSkinObjectChainReachesPawn(O,Pawn))
+            local Spatial=false
+            if not Linked then Spatial=select(1,ArmorSkinSpatialCandidateMatchesPawn(O,Pawn)) end
+            if Linked or Spatial then
+                Added=Added+ArmorSkinAppendRemoteAttachedSlots(O,"third-person-remote-sync-reflection",Slots,Seen)
+                for J,SC in ipairs(WarthogGetActorComponents(O) or {}) do
+                    if J>64 then break end
+                    Added=Added+ArmorSkinAppendRemoteAttachedSlots(SC,"third-person-remote-sync-reflection-component",Slots,Seen)
+                end
+            end
+        end
+    end
+    local Key=ArmorSkinObjectKey(Pawn) or tostring(SafeFullName(Pawn) or "")
+    if Added>0 then
+        Log("ARMORSKIN remote sync reflection resolved pawn=%s slots=%d seeds=%d objects=%d",tostring(SafeFullName(Pawn) or Pawn),Added,Seeds,#Queue)
+        return Added,"sync-reflection"
+    end
+    if not ArmorSkinSyncReflectionAuditLogged["reflect:"..Key] then
+        ArmorSkinSyncReflectionAuditLogged["reflect:"..Key]=true
+        local P=table.concat(Audit,","); if #P>4200 then P=string.sub(P,1,4200).."..." end
+        local F=table.concat(FunctionAudit,","); if #F>1800 then F=string.sub(F,1,1800).."..." end
+        Log("ARMORSKIN sync reflection audit pawn=%s seeds=%d objects=%d props=%s functions=%s",
+            tostring(SafeFullName(Pawn) or Pawn),Seeds,#Queue,P,F)
+    end
+    return 0,"sync-reflection-unresolved"
+end
+
+function RegisterArmorSkinCVWConstructionListener()
+    if ArmorSkinCVWConstructionListenerReady then return true end
+    local Ok,Err=pcall(function()
+        NotifyOnNewObject("/Game/Blueprints/CVW/BPC_SkeletalMesh.BPC_SkeletalMesh_C",function(Component)
+            ArmorSkinCacheCVWSkeletal(Component,"NotifyOnNewObject")
+        end)
+    end)
+    if Ok then
+        ArmorSkinCVWConstructionListenerReady=true
+        Log("ARMORSKIN CVW BPC_SkeletalMesh construction listener ready; remote presentation cache is event-driven")
+        return true
+    end
+    Log("ARMORSKIN CVW BPC_SkeletalMesh construction listener unavailable: %s",tostring(Err))
+    return false
+end
+
+function ArmorSkinStateFirstPersonCount(State)
+    if type(State) ~= "table" then return 0 end
+    local Count = 0
+    for _, Item in ipairs(State.Items or {}) do
+        local Scope = string.lower(tostring(Item.Scope or ""))
+        if string.find(Scope, "first-person", 1, true) == 1 then Count = Count + 1 end
+    end
+    return Count
+end
+
+function ArmorSkinScanSlots(Pawn)
+    Pawn = Unwrap(Pawn)
+    if not IsValidObject(Pawn) then return {}, nil, "pawn unavailable", nil end
+    local Biped = ArmorSkinFindThirdPersonBiped(Pawn)
+    local Slots = {}
+    local Seen = {}
+    local ThirdPersonSlots = 0
+    local FirstPersonSlots = 0
+    local ThirdPersonRoute = "biped-components"
+    if IsValidObject(Biped) then
+        for _, Component in ipairs(WarthogGetActorComponents(Biped) or {}) do
+            ThirdPersonSlots = ThirdPersonSlots
+                + ArmorSkinAppendMatchingSlots(Component, "third-person", Slots, Seen, false)
+        end
+    else
+        -- First retain the stable RC3_31 direct pawn-component route.
+        for ComponentIndex, Component in ipairs(WarthogGetActorComponents(Pawn) or {}) do
+            if ComponentIndex > 128 then break end
+            ThirdPersonSlots = ThirdPersonSlots
+                + ArmorSkinAppendMatchingSlots(Component, "third-person-pawn-fallback", Slots, Seen, false)
+        end
+        if ThirdPersonSlots > 0 then
+            Biped = Pawn
+            ThirdPersonRoute = "pawn-components-fallback"
+            Log("ARMORSKIN remote third-person pawn-component fallback pawn=%s slots=%d",
+                tostring(SafeFullName(Pawn) or Pawn), ThirdPersonSlots)
+        else
+            -- RC3_36: exact BP_SpartansBipedActor assignment is now the only
+            -- observer-side presentation route. The A15 live test proved this
+            -- works. Do not scan hundreds of CVW components while the biped is
+            -- still constructing; network retries + NotifyOnNewObject will reapply.
+            local PendingKind = ArmorSkinLocalPlayerIndexForPawn(Pawn) ~= nil and "local" or "remote"
+            return {}, nil, PendingKind .. " third-person Spartan biped pending", nil
+        end
+    end
+
+    -- RC3_24: this discovery is deliberately independent of the reflected
+    -- Pawn.FirstPersonArmsSkeletalMesh property. The RC3_23 live log reported
+    -- arms=unavailable on every scan, which meant the old component fallback was
+    -- never entered at all.
+    local FirstPersonCandidates, FirstPersonRoute = ArmorSkinFirstPersonCandidates(Pawn)
+    local ArmsKey = nil
+    for CandidateIndex, RawCandidate in ipairs(FirstPersonCandidates) do
+        if CandidateIndex > 8 then break end
+        local Candidate = Unwrap(RawCandidate)
+        if IsValidObject(Candidate) and not ArmorSkinObjectLooksLikeWeapon(Candidate) then
+            ArmsKey = ArmsKey or ArmorSkinObjectKey(Candidate)
+            FirstPersonSlots = FirstPersonSlots
+                + ArmorSkinAppendMatchingSlots(Candidate, "first-person-root", Slots, Seen, true)
+
+            for _, Name in ipairs({"AttachParent", "LeaderPoseComponent", "MasterPoseComponent"}) do
+                local Value = nil
+                pcall(function() Value = Unwrap(Candidate[Name]) end)
+                if IsValidObject(Value) and not ArmorSkinObjectLooksLikeWeapon(Value) then
+                    FirstPersonSlots = FirstPersonSlots
+                        + ArmorSkinAppendMatchingSlots(Value, "first-person-pose", Slots, Seen, true)
+                    for _, Component in ipairs(WarthogGetActorComponents(Value) or {}) do
+                        local LowerComponent = string.lower(ArmorSkinObjectDescriptionForDetection(Component))
+                        local LooksLikeArmsMesh = string.find(LowerComponent, "bpc_fp_skeletalmesh", 1, true) ~= nil
+                            or string.find(LowerComponent, "firstpersonarms", 1, true) ~= nil
+                            or string.find(LowerComponent, "arms", 1, true) ~= nil
+                            or string.find(LowerComponent, "hand", 1, true) ~= nil
+                        FirstPersonSlots = FirstPersonSlots
+                            + ArmorSkinAppendMatchingSlots(Component, "first-person-pose-component", Slots, Seen, LooksLikeArmsMesh)
+                    end
+                end
+            end
+
+            -- AttachChildren can include the held weapon or a weapon-owned render
+            -- component. RC3_27 descends one bounded level and inspects the child's
+            -- owner/components too. Anything that looks like a weapon keeps the strict
+            -- Chief/arms material-name gate so weapon skins cannot be recolored.
+            local Children = nil
+            pcall(function() Children = Candidate.AttachChildren end)
+            for ChildIndex, ChildValue in ipairs(ArrayValues(Children)) do
+                if ChildIndex > 20 then break end
+                local Child = Unwrap(ChildValue)
+                if IsValidObject(Child) then
+                    local ChildWeapon = ArmorSkinObjectLooksLikeWeapon(Child)
+                    if not ChildWeapon then
+                        FirstPersonSlots = FirstPersonSlots
+                            + ArmorSkinAppendMatchingSlots(Child, "first-person-child", Slots, Seen, false)
+                    end
+                    local Owner = nil
+                    pcall(function() Owner = Unwrap(Child:GetOwner()) end)
+                    if IsValidObject(Owner) then
+                        for OwnerIndex, OwnerComponent in ipairs(WarthogGetActorComponents(Owner) or {}) do
+                            if OwnerIndex > 64 then break end
+                            local Desc = string.lower(ArmorSkinObjectDescriptionForDetection(OwnerComponent))
+                            local LooksArm = string.find(Desc, "arm", 1, true) ~= nil
+                                or string.find(Desc, "hand", 1, true) ~= nil
+                                or string.find(Desc, "glove", 1, true) ~= nil
+                                or string.find(Desc, "chief", 1, true) ~= nil
+                                or string.find(Desc, "spartan", 1, true) ~= nil
+                            FirstPersonSlots = FirstPersonSlots
+                                + ArmorSkinAppendMatchingSlots(OwnerComponent, "first-person-attached-owner", Slots, Seen, LooksArm)
+                        end
+                    end
+                end
+            end
+
+            -- Also inspect owner-only / FP-marked pawn render components with the
+            -- strict material-name gate. This catches builds where the visible arms
+            -- are a sibling render component rather than the BPC_FP wrapper itself.
+            for ComponentIndex, RawComponent in ipairs(WarthogGetActorComponents(Pawn) or {}) do
+                if ComponentIndex > 96 then break end
+                local Component = Unwrap(RawComponent)
+                if IsValidObject(Component) and not ArmorSkinObjectLooksLikeWeapon(Component) then
+                    local Desc = string.lower(ArmorSkinObjectDescriptionForDetection(Component))
+                    local OnlyOwner = false
+                    pcall(function() OnlyOwner = Component.bOnlyOwnerSee == true end)
+                    local LooksFp = OnlyOwner or string.find(Desc, "firstperson", 1, true) ~= nil
+                        or string.find(Desc, "bpc_fp_", 1, true) ~= nil
+                    if LooksFp then
+                        FirstPersonSlots = FirstPersonSlots
+                            + ArmorSkinAppendMatchingSlots(Component, "first-person-sibling", Slots, Seen, false)
+                    end
+                end
+            end
+        end
+    end
+
+    Log("ARMORSKIN slot scan thirdPerson=%d firstPerson=%d total=%d arms=%s route=%s candidates=%d thirdRoute=%s",
+        ThirdPersonSlots, FirstPersonSlots, #Slots, tostring(ArmsKey or "unavailable"),
+        tostring(FirstPersonRoute or "unavailable"), #FirstPersonCandidates, tostring(ThirdPersonRoute))
+    local ScanInfo = {
+        ThirdPersonSlots = ThirdPersonSlots,
+        ThirdPersonRoute = ThirdPersonRoute,
+        FirstPersonSlots = FirstPersonSlots,
+        FirstPersonArmsKey = ArmsKey,
+        FirstPersonCandidateCount = #FirstPersonCandidates,
+        FirstPersonRoute = FirstPersonRoute,
+    }
+    if #Slots == 0 then return {}, Biped, "default Chief armor/arms material slots unavailable", ScanInfo end
+    return Slots, Biped, nil, ScanInfo
+end
+
+function ArmorSkinRestoreTarget(TargetKey, Reason)
+    local State = ArmorSkinAppliedByTarget[TargetKey]
+    if type(State) ~= "table" then return true end
+    -- V12: network-local Classic state intentionally retains no component UObjects.
+    -- Never attempt restore through old V11 network refs across respawn/model swaps.
+    if State.NetworkLocalTPStateless == true or State.NetworkLocalTPOnly == true then
+        ArmorSkinAppliedByTarget[TargetKey] = nil
+        Log("CLASSIC18V12 NET STATE DROP target=%s reason=%s no-cached-component-restore",
+            tostring(TargetKey), tostring(Reason or "model/lifecycle"))
+        return true
+    end
+    local Restored, Failed = 0, 0
+    for _, Item in ipairs(State.Items or {}) do
+        if IsValidObject(Item.Component) and IsValidObject(Item.OriginalMaterial) then
+            local Ok = pcall(function() Item.Component:SetMaterial(Item.Slot, Item.OriginalMaterial) end)
+            if Ok then
+                Restored = Restored + 1
+            else
+                Failed = Failed + 1
+            end
+        end
+    end
+    ArmorSkinAppliedByTarget[TargetKey] = nil
+    Log("ARMORSKIN restore target=%s reason=%s restored=%d failed=%d",
+        tostring(TargetKey), tostring(Reason or "original"), Restored, Failed)
+    return Failed == 0
+end
+
+function ArmorSkinDropAllRuntimeRefs(Reason)
+    if ArmorSkinCancelSlicedJobs ~= nil then ArmorSkinCancelSlicedJobs(Reason or "runtime refs dropped") end
+    ArmorSkinAppliedByTarget = {}
+    ArmorSkinFirstPersonRetryByTarget = {}
+    ArmorSkinPerspectiveRebindToken = { [1] = 0, [2] = 0 }
+    ArmorSkinLocalSettledToken = { [1] = 0, [2] = 0 }
+    ArmorSkinLocalReassertToken = { [1] = (tonumber(ArmorSkinLocalReassertToken[1]) or 0)+1, [2] = (tonumber(ArmorSkinLocalReassertToken[2]) or 0)+1 }
+    Log("ARMORSKIN runtime MID refs dropped: %s", tostring(Reason or "world boundary"))
+end
+
+function ArmorSkinCancelSlicedJobs(Reason)
+    ArmorSkinSlicedPumpToken=(tonumber(ArmorSkinSlicedPumpToken) or 0)+1
+    ArmorSkinSlicedJobsByTarget={}
+    ArmorSkinSlicedJobOrder={}
+    ArmorSkinSlicedPumpScheduled=false
+    Log("ARMORSKIN sliced jobs cancelled: %s",tostring(Reason or "lifecycle boundary"))
+end
+
+function ArmorSkinDropTargetRuntimeRefs(TargetKey, Reason)
+    if TargetKey==nil then return end
+    ArmorSkinAppliedByTarget[TargetKey]=nil
+    ArmorSkinFirstPersonRetryByTarget[TargetKey]=nil
+    local J=ArmorSkinSlicedJobsByTarget[TargetKey]
+    if type(J)=="table" then ArmorSkinSlicedJobsByTarget[TargetKey]=nil end
+    Log("ARMORSKIN target runtime refs dropped target=%s reason=%s",tostring(TargetKey),tostring(Reason or "rebind"))
+end
+
+function ArmorSkinItemMIDIsBound(Item)
+    if type(Item)~="table" or not IsValidObject(Item.Component) or not IsValidObject(Item.MID) then return false end
+    local Current=nil
+    pcall(function() Current=Unwrap(Item.Component:GetMaterial(Item.Slot)) end)
+    if not IsValidObject(Current) then return false end
+    return ArmorSkinSameObject(Current,Item.MID)
+end
+
+-- RC3_59 shared palette -------------------------------------------------------
+-- A component-owned MID dies with the old respawn mesh.  Creating/configuring a
+-- new MID for every one of 20/38 slots is the source of the visible hitching.
+-- Build one MID per (stock source material, TP/FP scope, CE color) with WORLD as
+-- its outer, then reuse that material interface across every compatible slot and
+-- every respawn in the current world.  Respawn/recolor becomes SetMaterial only.
+function ArmorSkinPaletteScopeKey(Item)
+    local Scope=string.lower(tostring(type(Item)=="table" and Item.Scope or ""))
+    if string.find(Scope,"first-person",1,true)==1 then return "FP" end
+    return "TP"
+end
+
+function ArmorSkinPaletteCanonicalSource(Material)
+    Material=Unwrap(Material)
+    if not IsValidObject(Material) then return nil end
+    local K=ArmorSkinObjectKey(Material)
+    local Source=K and ArmorSkinPaletteSourceByMIDKey[K] or nil
+    Source=Unwrap(Source)
+    if IsValidObject(Source) then return Source end
+    return Material
+end
+
+function ArmorSkinPaletteReset(Reason)
+    ArmorSkinPaletteMIDByKey={}
+    ArmorSkinPlayerMIDByKey={}
+    ArmorSkinPaletteSourceByMIDKey={}
+    ArmorSkinPaletteLibraryCache=nil
+    ArmorSkinPaletteCreatedCount=0
+    ArmorSkinPlayerMIDCreatedCount=0
+    ArmorSkinPlayerMIDPrewarmToken=(tonumber(ArmorSkinPlayerMIDPrewarmToken) or 0)+1
+    ArmorSkinPlayerMIDPrewarmGeneration=-1
+    Log("ARMORSKIN shared/player material cache reset: %s",tostring(Reason or "world boundary"))
+end
+
+function ArmorSkinPaletteLibrary()
+    local L=Unwrap(ArmorSkinPaletteLibraryCache)
+    if IsValidObject(L) then return L end
+    pcall(function() L=Unwrap(StaticFindObject("/Script/Engine.Default__KismetMaterialLibrary")) end)
+    if IsValidObject(L) then ArmorSkinPaletteLibraryCache=L; return L end
+    return nil
+end
+
+function ArmorSkinCreateWorldPaletteMID(SourceMaterial,ScopeKey,ColorIndex,Texture)
+    SourceMaterial=ArmorSkinPaletteCanonicalSource(SourceMaterial)
+    Texture=Unwrap(Texture)
+    if not IsValidObject(SourceMaterial) or not IsValidObject(Texture) then return nil,0,"invalid source/texture" end
+    local Library=ArmorSkinPaletteLibrary()
+    local Context=nil
+    pcall(function() Context=Unwrap(UEHelpers.GetWorldContextObject()) end)
+    if not IsValidObject(Library) or not IsValidObject(Context) then return nil,0,"KismetMaterialLibrary/world unavailable" end
+    ArmorSkinPaletteSerial=(tonumber(ArmorSkinPaletteSerial) or 0)+1
+    local Name=FName(string.format("HCEArmorPalette_%s_%02d_%d",tostring(ScopeKey),tonumber(ColorIndex) or 0,ArmorSkinPaletteSerial))
+    local MID=nil
+    local LastErr="CreateDynamicMaterialInstance failed"
+    local Ok,Err=pcall(function()
+        MID=Unwrap(Library:CreateDynamicMaterialInstance(Context,SourceMaterial,Name,0))
+    end)
+    if not Ok or not IsValidObject(MID) then
+        LastErr=tostring(Err or LastErr)
+        Ok,Err=pcall(function()
+            MID=Unwrap(Library:CreateDynamicMaterialInstance(Context,SourceMaterial,Name))
+        end)
+        if not Ok then LastErr=tostring(Err or LastErr) end
+    end
+    if not IsValidObject(MID) then return nil,0,LastErr end
+
+    local Count=0
+    if tostring(ScopeKey)=="FP" then
+        local Diffuse=ArmorSkinFindDiffuseParams(SourceMaterial) or {}
+        local TP,VP=ArmorSkinCollectFirstPersonParams(SourceMaterial)
+        local Good,A,B,C=ArmorSkinSetFirstPersonOverrides(MID,Diffuse,TP,VP,Texture,ColorIndex)
+        Count=(tonumber(A) or 0)+(tonumber(B) or 0)+(tonumber(C) or 0)
+        if not Good then return nil,Count,"FP palette parameter setup failed" end
+    else
+        local Params=ArmorSkinFindDiffuseParams(SourceMaterial)
+        if Params==nil or #Params<=0 then return nil,0,"no diffuse params" end
+        local Good,N=ArmorSkinSetTextureOnMID(MID,Params,Texture)
+        Count=tonumber(N) or 0
+        if not Good then return nil,Count,"TP palette parameter setup failed" end
+    end
+    ArmorSkinPaletteCreatedCount=(tonumber(ArmorSkinPaletteCreatedCount) or 0)+1
+    local MK=ArmorSkinObjectKey(MID)
+    if MK~=nil then ArmorSkinPaletteSourceByMIDKey[MK]=SourceMaterial end
+    Log("ARMORSKIN shared palette CREATED #%d scope=%s color=%s parent=%s parameterSets=%d",
+        tonumber(ArmorSkinPaletteCreatedCount) or 0,tostring(ScopeKey),ArmorSkinColorLabel(ColorIndex),
+        tostring(SafeFullName(SourceMaterial) or SourceMaterial),Count)
+    return MID,Count,nil
+end
+
+function ArmorSkinPaletteMIDForItem(Item,ColorIndex,Texture)
+    if type(Item)~="table" then return nil,0,false,"invalid item" end
+    local Source=ArmorSkinPaletteCanonicalSource(Item.OriginalMaterial)
+    if not IsValidObject(Source) then return nil,0,false,"invalid original material" end
+    Item.OriginalMaterial=Source
+    local ScopeKey=ArmorSkinPaletteScopeKey(Item)
+    local SourceKey=ArmorSkinObjectKey(Source) or tostring(SafeFullName(Source) or Source)
+    local Key=string.format("%s|%s|%d",tostring(SourceKey),tostring(ScopeKey),tonumber(ColorIndex) or 0)
+    local Entry=ArmorSkinPaletteMIDByKey[Key]
+    if type(Entry)=="table" and IsValidObject(Unwrap(Entry.MID)) then
+        return Unwrap(Entry.MID),0,false,nil
+    end
+    local MID,Count,Err=ArmorSkinCreateWorldPaletteMID(Source,ScopeKey,ColorIndex,Texture)
+    if not IsValidObject(MID) then return nil,tonumber(Count) or 0,false,Err end
+    ArmorSkinPaletteMIDByKey[Key]={MID=MID,SourceMaterial=Source,ScopeKey=ScopeKey,ColorIndex=tonumber(ColorIndex) or 0}
+    return MID,tonumber(Count) or 0,true,nil
+end
+
+-- RC3_60 mutable per-player shared materials ---------------------------------
+-- A color palette per color still requires SetMaterial on every slot whenever
+-- the color changes. Instead, keep one MID per (PlayerId, source material, TP/FP)
+-- and leave every compatible slot permanently bound to it for the life of the
+-- current biped. Recolor then changes parameters on only 2-3 MIDs total.
+function ArmorSkinPlayerMIDKey(PlayerId,SourceMaterial,ScopeKey)
+    local Pid=tonumber(PlayerId)
+    SourceMaterial=ArmorSkinPaletteCanonicalSource(SourceMaterial)
+    if Pid==nil or not IsValidObject(SourceMaterial) then return nil end
+    local SourceKey=ArmorSkinObjectKey(SourceMaterial) or tostring(SafeFullName(SourceMaterial) or SourceMaterial)
+    return string.format("P:%d|%s|%s",math.floor(Pid),tostring(SourceKey),tostring(ScopeKey or "TP"))
+end
+
+function ArmorSkinConfigurePlayerSharedMID(MID,SourceMaterial,ScopeKey,ColorIndex,Texture)
+    MID=Unwrap(MID); SourceMaterial=ArmorSkinPaletteCanonicalSource(SourceMaterial); Texture=Unwrap(Texture)
+    if not IsValidObject(MID) or not IsValidObject(SourceMaterial) or not IsValidObject(Texture) then return false,0 end
+    if tostring(ScopeKey)=="FP" then
+        local Diffuse=ArmorSkinFindDiffuseParams(SourceMaterial) or {}
+        local TP,VP=ArmorSkinCollectFirstPersonParams(SourceMaterial)
+        local Good,A,B,C=ArmorSkinSetFirstPersonOverrides(MID,Diffuse,TP,VP,Texture,ColorIndex)
+        return Good,(tonumber(A) or 0)+(tonumber(B) or 0)+(tonumber(C) or 0)
+    end
+    local Params=ArmorSkinFindDiffuseParams(SourceMaterial)
+    if Params==nil or #Params<=0 then return false,0 end
+    return ArmorSkinSetTextureOnMID(MID,Params,Texture)
+end
+
+function ArmorSkinPlayerSharedMIDForItem(Item,PlayerId,ColorIndex,Texture)
+    if type(Item)~="table" then return nil,0,false,"invalid item" end
+    local Source=ArmorSkinPaletteCanonicalSource(Item.OriginalMaterial)
+    if not IsValidObject(Source) then return nil,0,false,"invalid original material" end
+    local ScopeKey=ArmorSkinPaletteScopeKey(Item)
+    local Key=ArmorSkinPlayerMIDKey(PlayerId,Source,ScopeKey)
+    if Key==nil then return nil,0,false,"invalid player id" end
+    local Entry=ArmorSkinPlayerMIDByKey[Key]
+    local MID=type(Entry)=="table" and Unwrap(Entry.MID) or nil
+    if IsValidObject(MID) then
+        local Sets=0
+        if tonumber(Entry.ColorIndex)~=tonumber(ColorIndex) then
+            local Good,N=ArmorSkinConfigurePlayerSharedMID(MID,Source,ScopeKey,ColorIndex,Texture)
+            if not Good then return nil,tonumber(N) or 0,false,"shared MID recolor failed" end
+            Entry.ColorIndex=tonumber(ColorIndex) or 0
+            Sets=tonumber(N) or 0
+        end
+        return MID,Sets,false,nil
+    end
+    -- RC3_62: use Unreal's normal world/Kismet MID creation path. Do not manually
+    -- construct a MaterialInstanceDynamic under GameInstance; that RC3_61 experiment
+    -- correlated with both untouched default Spartans turning gray before any skin bind.
+    local NewMID,Sets,Err=ArmorSkinCreateWorldPaletteMID(Source,ScopeKey,ColorIndex,Texture)
+    if not IsValidObject(NewMID) then return nil,tonumber(Sets) or 0,false,Err end
+    ArmorSkinPlayerMIDCreatedCount=(tonumber(ArmorSkinPlayerMIDCreatedCount) or 0)+1
+    ArmorSkinPlayerMIDByKey[Key]={MID=NewMID,SourceMaterial=Source,ScopeKey=ScopeKey,
+        PlayerId=tonumber(PlayerId),ColorIndex=tonumber(ColorIndex) or 0}
+    Log("ARMORSKIN player material CREATED #%d playerId=%s scope=%s color=%s parent=%s parameterSets=%d",
+        tonumber(ArmorSkinPlayerMIDCreatedCount) or 0,tostring(PlayerId),tostring(ScopeKey),ArmorSkinColorLabel(ColorIndex),
+        tostring(SafeFullName(Source) or Source),tonumber(Sets) or 0)
+    return NewMID,tonumber(Sets) or 0,true,nil
+end
+
+function ArmorSkinApplySharedPlayerColor(State,PlayerId,ColorIndex,Texture,Source)
+    if type(State)~="table" or #(State.Items or {})<=0 then return false,"no verified items" end
+    local Seen,Unique,Sets={},0,0
+    for _,Item in ipairs(State.Items or {}) do
+        local SourceMat=ArmorSkinPaletteCanonicalSource(Item.OriginalMaterial)
+        local ScopeKey=ArmorSkinPaletteScopeKey(Item)
+        local K=ArmorSkinPlayerMIDKey(PlayerId,SourceMat,ScopeKey)
+        if K~=nil and not Seen[K] then
+            Seen[K]=true
+            local MID,N,Created,Err=ArmorSkinPlayerSharedMIDForItem(Item,PlayerId,ColorIndex,Texture)
+            if not IsValidObject(MID) then return false,tostring(Err or "shared player MID unavailable") end
+            Unique=Unique+1; Sets=Sets+(tonumber(N) or 0)
+        end
+    end
+    -- Every slot is already bound to these exact mutable MIDs. No GetMaterial,
+    -- SetMaterial or per-slot work is needed for a normal same-biped recolor.
+    State.ColorIndex=tonumber(ColorIndex) or State.ColorIndex
+    ArmorSkinAppliedByTarget[ArmorSkinTargetKey(PlayerId,State.PlayerIndex)]=State
+    Log("ARMORSKIN shared-player recolor playerId=%s color=%s uniqueMIDs=%d parameterSets=%d source=%s",
+        tostring(PlayerId),ArmorSkinColorLabel(ColorIndex),Unique,Sets,tostring(Source or "cycle"))
+    return Unique>0,string.format("shared-player recolor mids=%d sets=%d",Unique,Sets)
+end
+
+function ArmorSkinForceReassertPlayerState(State,PlayerId,ColorIndex,Texture,Source)
+    if type(State)~="table" or #(State.Items or {})<=0 then return false,0,0,"state unavailable" end
+    local Seen,Unique,Sets={},0,0
+    for _,Item in ipairs(State.Items or {}) do
+        local SourceMat=ArmorSkinPaletteCanonicalSource(Item.OriginalMaterial)
+        local ScopeKey=ArmorSkinPaletteScopeKey(Item)
+        local K=ArmorSkinPlayerMIDKey(PlayerId,SourceMat,ScopeKey)
+        if K~=nil and not Seen[K] then
+            Seen[K]=true
+            local Entry=ArmorSkinPlayerMIDByKey[K]
+            local MID=type(Entry)=="table" and Unwrap(Entry.MID) or nil
+            if not IsValidObject(MID) then
+                MID=select(1,ArmorSkinPlayerSharedMIDForItem(Item,PlayerId,ColorIndex,Texture))
+                Entry=ArmorSkinPlayerMIDByKey[K]
+            end
+            if not IsValidObject(MID) then return false,Unique,Sets,"shared MID unavailable" end
+            local Good,N=ArmorSkinConfigurePlayerSharedMID(MID,SourceMat,ScopeKey,ColorIndex,Texture)
+            if not Good then return false,Unique,Sets,"shared MID reassert failed" end
+            if type(Entry)=="table" then Entry.ColorIndex=tonumber(ColorIndex) or Entry.ColorIndex end
+            Unique=Unique+1; Sets=Sets+(tonumber(N) or 0)
+        end
+    end
+    Log("ARMORSKIN shared-player FORCE REASSERT playerId=%s color=%s uniqueMIDs=%d parameterSets=%d source=%s",
+        tostring(PlayerId),ArmorSkinColorLabel(ColorIndex),Unique,Sets,tostring(Source or "lifecycle"))
+    return Unique>0,Unique,Sets,nil
+end
+
+function ArmorSkinRebindDetachedStateItems(State,Source)
+    if type(State)~="table" then return 0,0 end
+    local Detached,Rebound=0,0
+    for _,Item in ipairs(State.Items or {}) do
+        if IsValidObject(Item.Component) and IsValidObject(Item.MID) and not ArmorSkinItemMIDIsBound(Item) then
+            Detached=Detached+1
+            local Ok=pcall(function() Item.Component:SetMaterial(Item.Slot,Item.MID) end)
+            if Ok then Rebound=Rebound+1 end
+        end
+    end
+    if Detached>0 then
+        Log("ARMORSKIN lifecycle binding LATCH detached=%d rebound=%d source=%s",Detached,Rebound,tostring(Source or "lifecycle"))
+    end
+    return Detached,Rebound
+end
+
+function ArmorSkinScheduleLocalStateReassert(PlayerIndex,TargetKey,BipedKey,PlayerId,ColorIndex,Source)
+    PlayerIndex=tonumber(PlayerIndex)
+    if PlayerIndex~=1 and PlayerIndex~=2 then return end
+    ArmorSkinLocalReassertToken[PlayerIndex]=(tonumber(ArmorSkinLocalReassertToken[PlayerIndex]) or 0)+1
+    local Token=ArmorSkinLocalReassertToken[PlayerIndex]
+    local Generation=tonumber(WarthogColorRuntimeGeneration) or 0
+    for _,Delay in ipairs({700,2400}) do
+        ExecuteInGameThreadWithDelay(Delay,function()
+            if Token~=ArmorSkinLocalReassertToken[PlayerIndex] or ModTeardownGuard or not MissionReady
+                or (tonumber(WarthogColorRuntimeGeneration) or 0)~=Generation then return end
+            local State=ArmorSkinAppliedByTarget[TargetKey]
+            if type(State)~="table" or tostring(State.BipedKey or "")~=tostring(BipedKey or "")
+                or tonumber(State.ColorIndex)~=tonumber(ColorIndex) then return end
+            local Texture=ArmorSkinLoadTexture(ColorIndex)
+            if not IsValidObject(Texture) then return end
+            local Detached,Rebound=ArmorSkinRebindDetachedStateItems(State,string.format("P%d +%dms %s",PlayerIndex,Delay,tostring(Source or "reassert")))
+            local Ok,Unique,Sets=ArmorSkinForceReassertPlayerState(State,PlayerId,ColorIndex,Texture,
+                string.format("P%d +%dms %s",PlayerIndex,Delay,tostring(Source or "reassert")))
+            Log("ARMORSKIN local lifecycle REASSERT P%d delay=%dms detached=%d rebound=%d uniqueMIDs=%d parameterSets=%d ok=%s",
+                PlayerIndex,Delay,tonumber(Detached) or 0,tonumber(Rebound) or 0,tonumber(Unique) or 0,tonumber(Sets) or 0,tostring(Ok==true))
+        end)
+    end
+end
+
+function ArmorSkinFindKnownStockMaterial(Path)
+    local M=nil
+    pcall(function() M=Unwrap(StaticFindObject(Path)) end)
+    if not IsValidObject(M) then pcall(function() M=Unwrap(LoadAsset(Path)) end) end
+    if not IsValidObject(M) then
+        local Package=string.match(tostring(Path or ""),"^([^%.]+)")
+        if Package and Package~="" then pcall(function() M=Unwrap(LoadAsset(Package)) end) end
+    end
+    if not IsValidObject(M) then pcall(function() M=Unwrap(StaticFindObject(Path)) end) end
+    return IsValidObject(M) and M or nil
+end
+
+function ArmorSkinPrewarmPlayerMIDSet(PlayerId,Source,SeedColorIndex)
+    PlayerId=tonumber(PlayerId)
+    if PlayerId==nil then return 0,0 end
+    local Seed=tonumber(SeedColorIndex) or 1
+    if Seed<1 or Seed>#WarthogCEColors then Seed=1 end
+    local Texture=ArmorSkinLoadTexture(Seed) -- all 18 textures are already process-prewarmed in frontend.
+    if not IsValidObject(Texture) then return 0,3 end
+    local Base=ArmorSkinFindKnownStockMaterial("/Game/Characters/Spartans/Default/Materials/MI_Chief_Armor.MI_Chief_Armor")
+    local Masked=ArmorSkinFindKnownStockMaterial("/Game/Characters/Spartans/Default/Materials/MI_Chief_Armor_Masked.MI_Chief_Armor_Masked")
+    local Combos={}
+    if IsValidObject(Base) then
+        Combos[#Combos+1]={OriginalMaterial=Base,Scope="third-person prewarm"}
+        Combos[#Combos+1]={OriginalMaterial=Base,Scope="first-person prewarm"}
+    end
+    if IsValidObject(Masked) then Combos[#Combos+1]={OriginalMaterial=Masked,Scope="third-person masked prewarm"} end
+    local Ready,Failed=0,0
+    for _,Item in ipairs(Combos) do
+        local MID,_,_,Err=ArmorSkinPlayerSharedMIDForItem(Item,PlayerId,Seed,Texture)
+        if IsValidObject(MID) then Ready=Ready+1 else Failed=Failed+1; Log("ARMORSKIN player material PREWARM miss playerId=%s reason=%s",tostring(PlayerId),tostring(Err)) end
+    end
+    Log("ARMORSKIN player material PREWARM playerId=%s seed=%s ready=%d failed=%d source=%s",tostring(PlayerId),ArmorSkinColorLabel(Seed),Ready,Failed,tostring(Source or "mission load"))
+    return Ready,Failed
+end
+
+-- RC3_63 crash fix: material prewarm must never enumerate GameState.PlayerArray.
+-- The RC3_62 WinGDK crash dump is an access violation inside UE4SS.dll while
+-- ArrayValues() recursively calls Value:get() on a PlayerArray element. Lua pcall
+-- cannot catch that native invalid-pointer read. Prewarm therefore uses only
+-- explicit local controllers plus already-known numeric PlayerIds stored in Lua.
+function ArmorSkinPrewarmSafeKnownIds(Source)
+    if ModTeardownGuard or not MissionReady then return false end
+    local Seen,Players,Ready,Failed={},0,0,0
+    local function SeedFor(Pid,LocalIndex)
+        local Key=tostring(math.floor(Pid))
+        local Seed=tonumber(ArmorSkinNetworkColorByPlayerId[Key])
+        if (Seed==nil or Seed<=0) and tonumber(LocalIndex)~=nil then
+            Seed=tonumber(ArmorSkinLocalIndexByPlayer[tonumber(LocalIndex)])
+        end
+        if Seed==nil or Seed<=0 then Seed=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[Key]) end
+        if Seed==nil or Seed<=0 then Seed=1 end
+        return Seed
+    end
+    local function Add(Pid,LocalIndex,Why)
+        Pid=tonumber(Pid)
+        if Pid==nil then return end
+        Pid=math.floor(Pid)
+        if Seen[Pid] then return end
+        Seen[Pid]=true; Players=Players+1
+        local Seed=SeedFor(Pid,LocalIndex)
+        local A,B=ArmorSkinPrewarmPlayerMIDSet(Pid,
+            string.format("%s [%s]",tostring(Source or "mission load"),tostring(Why or "known-id")),Seed)
+        Ready=Ready+(tonumber(A) or 0); Failed=Failed+(tonumber(B) or 0)
+    end
+
+    -- Explicit local slots only; do not cross into GameState.PlayerArray here.
+    for I=1,2 do
+        local C=Unwrap(GetPlayer(I))
+        if IsValidObject(C) then Add(ArmorSkinPlayerIdFromController(C),I,"local-P"..tostring(I)) end
+    end
+
+    -- Numeric identities learned earlier by the network protocol are plain Lua
+    -- table keys and are safe to prewarm without touching live remote UObjects.
+    for K,_ in pairs(ArmorSkinNetworkColorByPlayerId or {}) do Add(tonumber(K),nil,"network-cache") end
+    for K,_ in pairs(ArmorSkinPersistentRemoteColorByPlayerId or {}) do Add(tonumber(K),nil,"persistent-remote") end
+    for K,_ in pairs(ArmorSkinNetworkOriginSlotByPlayerId or {}) do Add(tonumber(K),nil,"origin-slot-cache") end
+
+    Log("ARMORSKIN SAFE-ID PREWARM COMPLETE players=%d materials=%d failed=%d source=%s",
+        Players,Ready,Failed,tostring(Source or "mission load"))
+    return Players>0 and Failed==0
+end
+
+function ArmorSkinSchedulePlayerMIDPrewarm(Source)
+    ArmorSkinPlayerMIDPrewarmToken=(tonumber(ArmorSkinPlayerMIDPrewarmToken) or 0)+1
+    local Token=ArmorSkinPlayerMIDPrewarmToken
+    local G=tonumber(WarthogColorRuntimeGeneration) or 0
+    ArmorSkinPlayerMIDPrewarmGeneration=G
+    ArmorSkinPrewarmSafeKnownIds(tostring(Source or "mission load") .. " immediate")
+    ExecuteInGameThreadWithDelay(450,function()
+        if Token~=ArmorSkinPlayerMIDPrewarmToken or ModTeardownGuard or not MissionReady then return end
+        if (tonumber(WarthogColorRuntimeGeneration) or 0)~=G then return end
+        ArmorSkinPrewarmSafeKnownIds(tostring(Source or "mission load") .. " +450ms")
+    end)
+end
+
+function ArmorSkinApplyColorLegacyToExistingItem(Item,Texture,ColorIndex,ForceBind)
+    if type(Item)~="table" or not IsValidObject(Item.Component) or not IsValidObject(Item.MID) or not IsValidObject(Texture) then
+        return false,0,false
+    end
+    local ScopeLower=string.lower(tostring(Item.Scope or ""))
+    local IsFirstPerson=string.find(ScopeLower,"first-person",1,true)==1
+    local Good,Count=false,0
+    if IsFirstPerson then
+        local TSet,NSet,VSet=0,0,0
+        Good,TSet,NSet,VSet=ArmorSkinSetFirstPersonOverrides(Item.MID,Item.Params,
+            Item.FPTextureParams,Item.FPVectorParams,Texture,ColorIndex)
+        Count=(tonumber(TSet) or 0)+(tonumber(NSet) or 0)+(tonumber(VSet) or 0)
+    else
+        Good,Count=ArmorSkinSetTextureOnMID(Item.MID,Item.Params,Texture)
+    end
+    if not Good then return false,tonumber(Count) or 0,false end
+    local WasBound=ArmorSkinItemMIDIsBound(Item)
+    local BindOk=true
+    if ForceBind==true or not WasBound then
+        BindOk=pcall(function() Item.Component:SetMaterial(Item.Slot,Item.MID) end)
+    end
+    return BindOk,tonumber(Count) or 0,not WasBound
+end
+
+function ArmorSkinApplyColorToExistingItem(Item,Texture,ColorIndex,ForceBind,PlayerId)
+    if type(Item)~="table" or not IsValidObject(Item.Component) or not IsValidObject(Texture) then
+        return false,0,false
+    end
+    local SharedMID,SetupCount,Created,SharedErr=ArmorSkinPlayerSharedMIDForItem(Item,PlayerId,ColorIndex,Texture)
+    if IsValidObject(SharedMID) then
+        Item.MID=SharedMID
+        local WasBound=ArmorSkinItemMIDIsBound(Item)
+        local BindOk=true
+        if ForceBind==true or not WasBound then
+            BindOk=pcall(function() Item.Component:SetMaterial(Item.Slot,SharedMID) end)
+        end
+        return BindOk,tonumber(SetupCount) or 0,not WasBound
+    end
+    -- Conservative fallback: retain RC3_59 immutable palette path if the new
+    -- per-player shared MID path cannot be built on a specific game build.
+    local PaletteMID,PaletteCount,_,PaletteErr=ArmorSkinPaletteMIDForItem(Item,ColorIndex,Texture)
+    if IsValidObject(PaletteMID) then
+        Item.MID=PaletteMID
+        local WasBound=ArmorSkinItemMIDIsBound(Item)
+        local BindOk=true
+        if ForceBind==true or not WasBound then BindOk=pcall(function() Item.Component:SetMaterial(Item.Slot,PaletteMID) end) end
+        Log("ARMORSKIN player-MID FALLBACK palette scope=%s color=%s reason=%s",ArmorSkinPaletteScopeKey(Item),ArmorSkinColorLabel(ColorIndex),tostring(SharedErr or "unknown"))
+        return BindOk,tonumber(PaletteCount) or 0,not WasBound
+    end
+    if IsValidObject(Item.MID) then
+        Log("ARMORSKIN player-MID FALLBACK legacy scope=%s color=%s reason=%s / %s",
+            ArmorSkinPaletteScopeKey(Item),ArmorSkinColorLabel(ColorIndex),tostring(SharedErr or "unknown"),tostring(PaletteErr or "unknown"))
+        return ArmorSkinApplyColorLegacyToExistingItem(Item,Texture,ColorIndex,ForceBind)
+    end
+    return false,(tonumber(SetupCount) or 0)+(tonumber(PaletteCount) or 0),false
+end
+
+function ArmorSkinFinishSlicedJob(Job)
+    if type(Job)~="table" then return end
+    local TargetKey=Job.TargetKey
+    if Job.Mode=="update" then
+        local State=Job.ExistingState
+        if type(State)~="table" or #(State.Items or {})<=0 then
+            ArmorSkinSlicedJobsByTarget[TargetKey]=nil
+            Log("ARMORSKIN sliced update FAILED target=%s playerId=%s color=%s reason=state-lost source=%s",
+                tostring(TargetKey),tostring(Job.PlayerId),ArmorSkinColorLabel(Job.ColorIndex),tostring(Job.Source))
+            return
+        end
+        State.ColorIndex=Job.ColorIndex
+        State.Biped=Job.Biped; State.BipedKey=Job.BipedKey
+        State.Pawn=Job.Pawn; State.PawnKey=Job.PawnKey
+        ArmorSkinAppliedByTarget[TargetKey]=State
+        ArmorSkinSlicedJobsByTarget[TargetKey]=nil
+        Log("ARMORSKIN palette bind UPDATE COMPLETE target=%s playerId=%s color=%s slots=%d applied=%d rebound=%d failed=%d textureSets=%d source=%s",
+            tostring(TargetKey),tostring(Job.PlayerId),ArmorSkinColorLabel(Job.ColorIndex),#(Job.Slots or {}),
+            tonumber(Job.Applied) or 0,tonumber(Job.Rebound) or 0,tonumber(Job.Failed) or 0,tonumber(Job.TextureSets) or 0,tostring(Job.Source))
+        return
+    end
+
+    if (tonumber(Job.Applied) or 0)<=0 then
+        ArmorSkinSlicedJobsByTarget[TargetKey]=nil
+        Log("ARMORSKIN sliced rebuild FAILED target=%s playerId=%s color=%s failures=%d source=%s",
+            tostring(TargetKey),tostring(Job.PlayerId),ArmorSkinColorLabel(Job.ColorIndex),
+            tonumber(Job.Failed) or 0,tostring(Job.Source))
+        return
+    end
+    ArmorSkinAppliedByTarget[TargetKey]={
+        Biped=Job.Biped,BipedKey=Job.BipedKey,Pawn=Job.Pawn,PawnKey=Job.PawnKey,
+        PlayerId=Job.PlayerId,PlayerIndex=Job.PlayerIndex,ColorIndex=Job.ColorIndex,
+        Items=Job.Items,
+        FirstPersonArmsKey=Job.ScanInfo and Job.ScanInfo.FirstPersonArmsKey or Job.CurrentArmsKey,
+        FirstPersonSlotCount=Job.ScanInfo and tonumber(Job.ScanInfo.FirstPersonSlots) or 0,
+        FirstPersonCandidateCount=Job.ScanInfo and tonumber(Job.ScanInfo.FirstPersonCandidateCount) or 0,
+        FirstPersonRoute=Job.ScanInfo and Job.ScanInfo.FirstPersonRoute or Job.CurrentArmsRoute,
+    }
+    ArmorSkinSlicedJobsByTarget[TargetKey]=nil
+    local State=ArmorSkinAppliedByTarget[TargetKey]
+    if ArmorSkinStateFirstPersonCount(State)>0 then ArmorSkinFirstPersonRetryByTarget[TargetKey]=nil end
+    -- RC3_62 retains the RC3_61 finding: a local respawn/customization pass can mutate the parameters of a
+    -- still-bound shared MID back toward authored green. Binding equality alone
+    -- is therefore insufficient. Reassert each unique shared MID once after every
+    -- lifecycle rebuild, then repeat twice for local players without rescanning.
+    local ReassertTexture=Job.Texture
+    if IsValidObject(ReassertTexture) then
+        ArmorSkinForceReassertPlayerState(State,Job.PlayerId,Job.ColorIndex,ReassertTexture,"post-build lifecycle")
+    end
+    if tonumber(Job.PlayerIndex)==1 or tonumber(Job.PlayerIndex)==2 then
+        ArmorSkinScheduleLocalStateReassert(Job.PlayerIndex,TargetKey,Job.BipedKey,Job.PlayerId,Job.ColorIndex,"post-build lifecycle")
+    end
+    Log("ARMORSKIN palette bind VERIFIED target=%s playerId=%s color=%s slots=%d applied=%d rebound=%d verifyPasses=%d failed=%d textureSets=%d source=%s",
+        tostring(TargetKey),tostring(Job.PlayerId),ArmorSkinColorLabel(Job.ColorIndex),#(Job.Slots or {}),
+        tonumber(Job.Applied) or 0,tonumber(Job.Rebound) or 0,tonumber(Job.VerifyPass) or 0,
+        tonumber(Job.Failed) or 0,tonumber(Job.TextureSets) or 0,tostring(Job.Source))
+end
+
+function ArmorSkinProcessOneSlicedSlot(Job)
+    if type(Job)~="table" then return false end
+
+    if Job.Mode=="update" then
+        local I=tonumber(Job.NextIndex) or 1
+        local Item=Job.Slots and Job.Slots[I] or nil
+        if Item==nil then ArmorSkinFinishSlicedJob(Job); return false end
+        Job.NextIndex=I+1
+        local Ok,Count,WasDetached=ArmorSkinApplyColorToExistingItem(Item,Job.Texture,Job.ColorIndex,false,Job.PlayerId)
+        if Ok then
+            Job.Applied=(tonumber(Job.Applied) or 0)+1
+            Job.TextureSets=(tonumber(Job.TextureSets) or 0)+(tonumber(Count) or 0)
+            if WasDetached then Job.Rebound=(tonumber(Job.Rebound) or 0)+1 end
+        else
+            Job.Failed=(tonumber(Job.Failed) or 0)+1
+        end
+        return true
+    end
+
+    local Phase=tostring(Job.Phase or "paint")
+    if Phase=="verify" then
+        local I=tonumber(Job.VerifyIndex) or 1
+        local Item=Job.Items and Job.Items[I] or nil
+        if Item==nil then
+            local MaxPass=math.max(1,tonumber(ArmorSkinSlicedVerifyPasses) or 2)
+            if (tonumber(Job.VerifyPass) or 1)<MaxPass then
+                Job.VerifyPass=(tonumber(Job.VerifyPass) or 1)+1
+                Job.VerifyIndex=1
+                return true
+            end
+            ArmorSkinFinishSlicedJob(Job)
+            return false
+        end
+        Job.VerifyIndex=I+1
+        -- The game can silently put its authored green material back into a slot
+        -- after our first write. Retint the cached MID with the latest desired
+        -- color and rebind only if it is no longer the live slot material.
+        local Ok,Count,WasDetached=ArmorSkinApplyColorToExistingItem(Item,Job.Texture,Job.ColorIndex,false,Job.PlayerId)
+        if Ok then
+            Job.TextureSets=(tonumber(Job.TextureSets) or 0)+(tonumber(Count) or 0)
+            if WasDetached then Job.Rebound=(tonumber(Job.Rebound) or 0)+1 end
+        else
+            Job.VerifyFailed=(tonumber(Job.VerifyFailed) or 0)+1
+        end
+        return true
+    end
+
+    local I=tonumber(Job.NextIndex) or 1
+    local Item=Job.Slots and Job.Slots[I] or nil
+    if Item==nil then
+        Job.Phase="verify"
+        Job.VerifyPass=1
+        Job.VerifyIndex=1
+        return true
+    end
+    Job.NextIndex=I+1
+    if not IsValidObject(Item.Component) or not IsValidObject(Item.OriginalMaterial) or not IsValidObject(Job.Texture) then
+        Job.Failed=(tonumber(Job.Failed) or 0)+1; return true
+    end
+    local ScopeLower=string.lower(tostring(Item.Scope or ""))
+    local IsFirstPerson=string.find(ScopeLower,"first-person",1,true)==1
+    local Params=ArmorSkinFindDiffuseParams(Item.OriginalMaterial)
+    local FPTextureParams,FPVectorParams={},{}
+    if IsFirstPerson then
+        FPTextureParams,FPVectorParams=ArmorSkinCollectFirstPersonParams(Item.OriginalMaterial)
+    end
+    if Params==nil and not (IsFirstPerson and (#FPTextureParams>0 or #FPVectorParams>0)) then
+        Job.Failed=(tonumber(Job.Failed) or 0)+1; return true
+    end
+    local NewItem={Component=Item.Component,ComponentName=Item.ComponentName,Slot=Item.Slot,
+        OriginalMaterial=ArmorSkinPaletteCanonicalSource(Item.OriginalMaterial),MID=nil,Params=Params or {},FPTextureParams=FPTextureParams,
+        FPVectorParams=FPVectorParams,Scope=Item.Scope}
+    local Good,Count,WasDetached=ArmorSkinApplyColorToExistingItem(NewItem,Job.Texture,Job.ColorIndex,true,Job.PlayerId)
+    if not Good then
+        -- Fallback only if shared world-owned palette creation is unavailable.
+        ArmorSkinSlicedSerial=(tonumber(ArmorSkinSlicedSerial) or 0)+1
+        local MID=ArmorSkinCreateMID(Item,ArmorSkinSlicedSerial)
+        if IsValidObject(MID) then
+            NewItem.MID=MID
+            Good,Count,WasDetached=ArmorSkinApplyColorLegacyToExistingItem(NewItem,Job.Texture,Job.ColorIndex,true)
+        end
+    end
+    if not Good then Job.Failed=(tonumber(Job.Failed) or 0)+1; return true end
+    Job.Applied=(tonumber(Job.Applied) or 0)+1
+    Job.TextureSets=(tonumber(Job.TextureSets) or 0)+(tonumber(Count) or 0)
+    Job.Items[#Job.Items+1]=NewItem
+    return true
+end
+
+function ArmorSkinSlicedPump()
+    ArmorSkinSlicedPumpScheduled=false
+    if ModTeardownGuard or not MissionReady then return end
+    if (tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0)>os.clock() then
+        ArmorSkinSlicedPumpScheduled=true
+        local T=ArmorSkinSlicedPumpToken
+        ExecuteInGameThreadWithDelay(120,function() if T==ArmorSkinSlicedPumpToken then ArmorSkinSlicedPump() end end)
+        return
+    end
+    local Pick=nil
+    while #ArmorSkinSlicedJobOrder>0 do
+        local K=table.remove(ArmorSkinSlicedJobOrder,1)
+        local J=ArmorSkinSlicedJobsByTarget[K]
+        if type(J)=="table" then Pick=J; break end
+    end
+    if Pick~=nil then
+        local Still=true
+        local Batch=math.max(1,tonumber(ArmorSkinPaletteBindBatchSize) or 8)
+        for _=1,Batch do
+            if not Still or ArmorSkinSlicedJobsByTarget[Pick.TargetKey]~=Pick then break end
+            Still=ArmorSkinProcessOneSlicedSlot(Pick)
+        end
+        if Still and ArmorSkinSlicedJobsByTarget[Pick.TargetKey]==Pick then
+            ArmorSkinSlicedJobOrder[#ArmorSkinSlicedJobOrder+1]=Pick.TargetKey
+        end
+    end
+    if next(ArmorSkinSlicedJobsByTarget)~=nil then
+        ArmorSkinSlicedPumpScheduled=true
+        local T=ArmorSkinSlicedPumpToken
+        local Delay=tonumber(ArmorSkinSlicedSliceDelayMs) or 55
+        if Pick and Pick.Mode=="update" then Delay=tonumber(ArmorSkinSlicedUpdateDelayMs) or 35 end
+        ExecuteInGameThreadWithDelay(Delay,function()
+            if T==ArmorSkinSlicedPumpToken then ArmorSkinSlicedPump() end
+        end)
+    end
+end
+
+function ArmorSkinEnsureSlicedPump()
+    if ArmorSkinSlicedPumpScheduled or next(ArmorSkinSlicedJobsByTarget)==nil then return end
+    ArmorSkinSlicedPumpScheduled=true
+    local T=ArmorSkinSlicedPumpToken
+    ExecuteInGameThreadWithDelay(1,function() if T==ArmorSkinSlicedPumpToken then ArmorSkinSlicedPump() end end)
+end
+
+function ArmorSkinRetargetExistingSlicedJob(Job,ColorIndex,Texture,Source)
+    if type(Job)~="table" then return false end
+    local Old=tonumber(Job.ColorIndex)
+    Job.ColorIndex=tonumber(ColorIndex) or Job.ColorIndex
+    Job.Texture=Texture
+    Job.Source=Source or Job.Source
+    if Old~=tonumber(Job.ColorIndex) then
+        Log("ARMORSKIN palette bind RETARGET target=%s playerId=%s old=%s new=%s mode=%s source=%s",
+            tostring(Job.TargetKey),tostring(Job.PlayerId),ArmorSkinColorLabel(Old),ArmorSkinColorLabel(Job.ColorIndex),
+            tostring(Job.Mode or "build"),tostring(Source or "cycle"))
+    end
+    return true
+end
+
+function ArmorSkinQueueSlicedExistingUpdate(Pawn,PlayerId,PlayerIndex,ColorIndex,Texture,Source,TargetKey,Existing,Biped,BipedKey)
+    local Active=ArmorSkinSlicedJobsByTarget[TargetKey]
+    if type(Active)=="table" and tostring(Active.BipedKey or "")==tostring(BipedKey or "") then
+        ArmorSkinRetargetExistingSlicedJob(Active,ColorIndex,Texture,Source)
+        ArmorSkinEnsureSlicedPump()
+        return true,"sliced job retargeted"
+    end
+    local Items={}
+    for _,Item in ipairs(type(Existing)=="table" and (Existing.Items or {}) or {}) do Items[#Items+1]=Item end
+    if #Items<=0 then return false,"no existing MID items" end
+    local Job={Mode="update",TargetKey=TargetKey,Pawn=Pawn,PawnKey=ArmorSkinObjectKey(Pawn),Biped=Biped,BipedKey=BipedKey,
+        PlayerId=PlayerId,PlayerIndex=PlayerIndex,ColorIndex=ColorIndex,Texture=Texture,Source=Source or "cycle",
+        Slots=Items,Items=Items,NextIndex=1,ExistingState=Existing,Applied=0,Failed=0,Rebound=0,TextureSets=0}
+    ArmorSkinSlicedJobsByTarget[TargetKey]=Job
+    local Seen=false
+    for _,K in ipairs(ArmorSkinSlicedJobOrder) do if K==TargetKey then Seen=true break end end
+    if not Seen then ArmorSkinSlicedJobOrder[#ArmorSkinSlicedJobOrder+1]=TargetKey end
+    Log("ARMORSKIN palette bind UPDATE QUEUED target=%s playerId=%s color=%s slots=%d slice=%dms source=%s",
+        tostring(TargetKey),tostring(PlayerId),ArmorSkinColorLabel(ColorIndex),#Items,
+        tonumber(ArmorSkinSlicedUpdateDelayMs) or 35,tostring(Source or "cycle"))
+    ArmorSkinEnsureSlicedPump()
+    return true,string.format("sliced update queued slots=%d",#Items)
+end
+
+function ArmorSkinQueueSlicedRebuild(Pawn,PlayerId,PlayerIndex,ColorIndex,Texture,Source,TargetKey,CurrentArmsKey,CurrentArmsRoute)
+    local ExistingJob=ArmorSkinSlicedJobsByTarget[TargetKey]
+    local Biped=ArmorSkinFindThirdPersonBiped(Pawn)
+    local BipedKey=ArmorSkinObjectKey(Biped)
+    if type(ExistingJob)=="table" and ExistingJob.BipedKey~=nil and BipedKey~=nil
+        and tostring(ExistingJob.BipedKey)==tostring(BipedKey) then
+        ArmorSkinRetargetExistingSlicedJob(ExistingJob,ColorIndex,Texture,Source)
+        ArmorSkinEnsureSlicedPump()
+        return true,"sliced rebuild retargeted"
+    end
+    local Slots,NewBiped,ScanErr,ScanInfo=ArmorSkinScanSlots(Pawn)
+    if #Slots==0 or not IsValidObject(NewBiped) then return false,tostring(ScanErr) end
+    BipedKey=ArmorSkinObjectKey(NewBiped)
+    local Job={Mode="build",Phase="paint",TargetKey=TargetKey,Pawn=Pawn,PawnKey=ArmorSkinObjectKey(Pawn),Biped=NewBiped,BipedKey=BipedKey,
+        PlayerId=PlayerId,PlayerIndex=PlayerIndex,ColorIndex=ColorIndex,Texture=Texture,Source=Source or "cycle",
+        Slots=Slots,NextIndex=1,Items={},Applied=0,Failed=0,Rebound=0,VerifyFailed=0,TextureSets=0,ScanInfo=ScanInfo,
+        CurrentArmsKey=CurrentArmsKey,CurrentArmsRoute=CurrentArmsRoute}
+    ArmorSkinSlicedJobsByTarget[TargetKey]=Job
+    local Seen=false
+    for _,K in ipairs(ArmorSkinSlicedJobOrder) do if K==TargetKey then Seen=true break end end
+    if not Seen then ArmorSkinSlicedJobOrder[#ArmorSkinSlicedJobOrder+1]=TargetKey end
+    Log("ARMORSKIN palette bind QUEUED target=%s playerId=%s color=%s slots=%d slice=%dms verifyPasses=%d source=%s",
+        tostring(TargetKey),tostring(PlayerId),ArmorSkinColorLabel(ColorIndex),#Slots,
+        tonumber(ArmorSkinSlicedSliceDelayMs) or 55,tonumber(ArmorSkinSlicedVerifyPasses) or 2,tostring(Source or "cycle"))
+    ArmorSkinEnsureSlicedPump()
+    return true,string.format("sliced rebuild queued slots=%d",#Slots)
+end
+
+function ArmorSkinApplyToPawn(Pawn, PlayerId, PlayerIndex, ColorIndex, Source)
+    Pawn=Unwrap(Pawn)
+    ColorIndex=tonumber(ColorIndex) or 0
+    if not IsValidObject(Pawn) or ColorIndex<0 or ColorIndex>#WarthogCEColors then return false,"invalid pawn/color" end
+    local QuietUntil=tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0
+    if QuietUntil>os.clock() then return false,"biped construction settle gate" end
+    local TargetKey=ArmorSkinTargetKey(PlayerId,PlayerIndex)
+
+    if ColorIndex==0 then
+        local Active=ArmorSkinSlicedJobsByTarget[TargetKey]
+        if type(Active)=="table" then ArmorSkinSlicedJobsByTarget[TargetKey]=nil end
+        ArmorSkinRestoreTarget(TargetKey,Source or "original")
+        return true,"ORIGINAL GREEN"
+    end
+
+    local Texture,TexErr=ArmorSkinLoadTexture(ColorIndex)
+    if not IsValidObject(Texture) then return false,tostring(TexErr) end
+    local Biped=ArmorSkinFindThirdPersonBiped(Pawn)
+    local BipedKey=ArmorSkinObjectKey(Biped)
+    local Existing=ArmorSkinAppliedByTarget[TargetKey]
+    local ExistingBipedKey=nil
+    if type(Existing)=="table" then ExistingBipedKey=Existing.BipedKey or ArmorSkinObjectKey(Existing.Biped) end
+    local SameBiped=type(Existing)=="table" and BipedKey~=nil and tostring(ExistingBipedKey or "")==tostring(BipedKey)
+    local CurrentArms,CurrentArmsKey,CurrentArmsRoute=ArmorSkinFirstPersonAnchor(Pawn)
+    local ExistingFirstPerson=ArmorSkinStateFirstPersonCount(Existing)
+    local FirstPersonNeedsRescan=SameBiped and IsValidObject(CurrentArms)
+        and (ExistingFirstPerson<=0 or (Existing.FirstPersonArmsKey~=nil and CurrentArmsKey~=nil
+            and tostring(Existing.FirstPersonArmsKey)~=tostring(CurrentArmsKey)))
+
+    local Active=ArmorSkinSlicedJobsByTarget[TargetKey]
+    if type(Active)=="table" and Active.BipedKey~=nil and BipedKey~=nil
+        and tostring(Active.BipedKey)==tostring(BipedKey) then
+        ArmorSkinRetargetExistingSlicedJob(Active,ColorIndex,Texture,Source)
+        ArmorSkinEnsureSlicedPump()
+        return true,"sliced job retargeted"
+    end
+
+    if SameBiped and #(Existing.Items or {})>0 and not FirstPersonNeedsRescan then
+        if tonumber(Existing.ColorIndex)==tonumber(ColorIndex) then return true,"already verified settled" end
+        -- RC3_60: the slots stay bound to one mutable shared MID set per player.
+        -- Normal color changes touch only the 2-3 unique shared MIDs: no 38-slot
+        -- SetMaterial pass and no per-slot GetMaterial verification on the hot path.
+        return ArmorSkinApplySharedPlayerColor(Existing,PlayerId,ColorIndex,Texture,Source)
+    end
+
+    -- Never restore every slot merely because FP arms or the presentation biped
+    -- changed. That caused RC3_57 to flash/revert the whole Spartan to green.
+    -- Drop only Lua refs and let the new verified sliced rebuild replace live slots.
+    if type(Existing)=="table" then
+        ArmorSkinDropTargetRuntimeRefs(TargetKey,FirstPersonNeedsRescan and "FP/binding lifecycle changed" or "biped lifecycle changed")
+    end
+
+    return ArmorSkinQueueSlicedRebuild(Pawn,PlayerId,PlayerIndex,ColorIndex,Texture,
+        Source,TargetKey,CurrentArmsKey,CurrentArmsRoute)
+end
+
+function ArmorSkinFindDefaultCatalogEntry()
+    if ArmorSkinDefaultCatalogIndex ~= nil and ArmorCatalog ~= nil and ArmorCatalog[ArmorSkinDefaultCatalogIndex] ~= nil then
+        return ArmorSkinDefaultCatalogIndex, ArmorCatalog[ArmorSkinDefaultCatalogIndex]
+    end
+    if ArmorCatalog == nil or #ArmorCatalog == 0 then BuildCatalog() end
+    if ArmorCatalog == nil or #ArmorCatalog == 0 then return nil, nil end
+
+    local Fallback = 1
+    for I, Entry in ipairs(ArmorCatalog) do
+        local Skin = string.lower(tostring(Entry.Skin or ""))
+        local Short = string.lower(tostring(Entry.Short or ""))
+        local Model = string.lower(tostring(Entry.Model or ""))
+        if Skin == "blam.customization.masterchief.default" or string.match(Skin, "%.default$") or Short == "default" then
+            ArmorSkinDefaultCatalogIndex = I
+            Log("ARMORSKIN default Spartan catalog entry=%d skin=%s model=%s", I, tostring(Entry.Skin), tostring(Entry.Model))
+            return I, Entry
+        end
+        if string.find(Model, "default", 1, true) ~= nil then Fallback = I end
+    end
+    ArmorSkinDefaultCatalogIndex = Fallback
+    Log("ARMORSKIN default Spartan exact tag not found; using catalog fallback entry=%d skin=%s model=%s",
+        Fallback, tostring(ArmorCatalog[Fallback].Skin), tostring(ArmorCatalog[Fallback].Model))
+    return Fallback, ArmorCatalog[Fallback]
+end
+
+function ArmorSkinCurrentModelIsDefault(PlayerIndex)
+    local Settings = GetUserSettings(PlayerIndex)
+    if not IsValidObject(Settings) then return false, "settings unavailable" end
+    local _, CurrentName = FindMasterChiefSelection(Settings)
+    if CurrentName == nil or CurrentName == "" or CurrentName == "None" then
+        -- A fresh local user may have no explicit customization tag; Halo then uses
+        -- the authored green default Spartan.
+        return true, "implicit default"
+    end
+    local _, DefaultEntry = ArmorSkinFindDefaultCatalogEntry()
+    if DefaultEntry == nil then return false, "default catalog entry unavailable" end
+    return string.lower(tostring(CurrentName)) == string.lower(tostring(DefaultEntry.Skin)), tostring(CurrentName)
+end
+
+function ArmorSkinEnsureDefaultModel(PlayerIndex, Source)
+    local IsDefault, Current = ArmorSkinCurrentModelIsDefault(PlayerIndex)
+    if IsDefault then return true, false end
+    local DefaultIndex, DefaultEntry = ArmorSkinFindDefaultCatalogEntry()
+    if DefaultIndex == nil or DefaultEntry == nil then return false, false, "default Spartan catalog entry unavailable" end
+
+    local Ok, Info = ApplyDirect(PlayerIndex, DefaultEntry)
+    if not Ok then return false, false, tostring(Info) end
+    CatalogIndex[PlayerIndex] = DefaultIndex
+    IndexInitialized[PlayerIndex] = true
+    Log("ARMORSKIN P%d model fallback %s -> default Spartan before skin cycle source=%s",
+        PlayerIndex, tostring(Current), tostring(Source or "skin input"))
+    return true, true, tostring(Info)
+end
+
+-- V15: desired Classic color is separate from committed/persisted/network state.
+-- A peer must never see a color until this machine has successfully applied it.
+ClassicArmorPendingCommitByPlayer = ClassicArmorPendingCommitByPlayer or {}
+-- V16: last exact local biped proof may survive benign assignment-table rebuilds,
+-- but NEVER a new Spartan construction event or world/runtime generation change.
+ClassicArmorV16BipedEpoch = ClassicArmorV16BipedEpoch or 0
+ClassicArmorV16LocalBipedProofByPlayer = ClassicArmorV16LocalBipedProofByPlayer or {}
+
+function ArmorSkinV15BeginPendingCommit(PlayerIndex, ColorIndex, Source)
+    PlayerIndex=math.max(1,math.min(2,tonumber(PlayerIndex) or 1))
+    ColorIndex=math.max(0,math.min(#WarthogCEColors,tonumber(ColorIndex) or 0))
+    ArmorSkinLocalIndexByPlayer[PlayerIndex]=ColorIndex
+    ClassicArmorPendingCommitByPlayer[PlayerIndex]={ColorIndex=ColorIndex,Source=tostring(Source or "Classic input")}
+    Log("CLASSIC18V15 PENDING P%d color=%s source=%s",PlayerIndex,ArmorSkinColorLabel(ColorIndex),tostring(Source or "Classic input"))
+end
+
+function ArmorSkinV15CommitPending(PlayerIndex, ColorIndex, Source)
+    PlayerIndex=math.max(1,math.min(2,tonumber(PlayerIndex) or 1))
+    ColorIndex=tonumber(ColorIndex) or 0
+    local P=ClassicArmorPendingCommitByPlayer[PlayerIndex]
+    if type(P)~="table" or tonumber(P.ColorIndex)~=ColorIndex then return false end
+    ClassicArmorPendingCommitByPlayer[PlayerIndex]=nil
+    ClassicArmorSetPersistentSelection(PlayerIndex,ColorIndex,tostring(Source or P.Source or "Classic").." V15 commit")
+    Log("CLASSIC18V15 COMMIT P%d color=%s source=%s",
+        PlayerIndex,ArmorSkinColorLabel(ColorIndex),tostring(Source or P.Source or "Classic"))
+    return true
+end
+
+function ArmorSkinV15AbortPending(PlayerIndex, ColorIndex, Source, Info)
+    PlayerIndex=math.max(1,math.min(2,tonumber(PlayerIndex) or 1))
+    ColorIndex=tonumber(ColorIndex) or 0
+    local P=ClassicArmorPendingCommitByPlayer[PlayerIndex]
+    if type(P)~="table" or tonumber(P.ColorIndex)~=ColorIndex then return false end
+    ClassicArmorPendingCommitByPlayer[PlayerIndex]=nil
+    local Committed=tonumber(ClassicArmorMenuSelectedByPlayer[PlayerIndex]) or 0
+    ArmorSkinLocalIndexByPlayer[PlayerIndex]=Committed
+    Log("CLASSIC18V15 ABORT P%d requested=%s reverted=%s source=%s info=%s",
+        PlayerIndex,ArmorSkinColorLabel(ColorIndex),ArmorSkinColorLabel(Committed),tostring(Source or P.Source or "Classic"),tostring(Info or "apply failed"))
+    return true
+end
+
+function ArmorSkinScheduleLocalApply(PlayerIndex, ColorIndex, Source, ModelChanged)
+    ArmorSkinLocalApplyToken[PlayerIndex] = (tonumber(ArmorSkinLocalApplyToken[PlayerIndex]) or 0) + 1
+    local Token = ArmorSkinLocalApplyToken[PlayerIndex]
+    ArmorSkinLocalSettledToken[PlayerIndex] = 0
+
+    -- V13: schedule retries as a CHAIN instead of enqueueing every future attempt
+    -- up front. Rapid Classic input in V12 could leave dozens of stale UE4SS
+    -- delayed callbacks in flight even though their tokens were obsolete. Only one
+    -- retry callback per local player may now exist at a time.
+    local Gaps = ModelChanged and { 80, 140, 230, 300, 300, 350 } or { 0, 180, 420 }
+    if VehicleMessageOfflineFastPath ~= true then
+        Gaps = ModelChanged
+            and { 2500, 350, 600, 900, 1300, 1800 }
+            or { 0, 180, 420, 600, 1000, 1300, 2000 }
+    end
+
+    local function QueueAttempt(AttemptIndex)
+        if AttemptIndex > #Gaps then return end
+        local GapMs = tonumber(Gaps[AttemptIndex]) or 0
+        ExecuteInGameThreadWithDelay(GapMs, function()
+            if ModTeardownGuard or Token ~= ArmorSkinLocalApplyToken[PlayerIndex] then return end
+            if ArmorSkinLocalSettledToken[PlayerIndex] == Token then return end
+            if tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) ~= tonumber(ColorIndex) then return end
+
+            local Controller = GetPlayer(PlayerIndex)
+            local Pawn = ArmorSkinGetPawnFromController(Controller)
+            local Ok, Info = false, "pawn unavailable"
+            if IsValidObject(Pawn) then
+                local PlayerId = ArmorSkinPlayerIdFromController(Controller)
+                Ok, Info = ArmorSkinApplyToPawn(Pawn, PlayerId, PlayerIndex, ColorIndex, Source)
+            end
+
+            if Ok then
+                ArmorSkinLocalSettledToken[PlayerIndex] = Token
+                if type(ArmorSkinV15CommitPending)=="function" then
+                    ArmorSkinV15CommitPending(PlayerIndex,ColorIndex,Source)
+                end
+                if ColorIndex > 0 and PerspectiveThirdPerson[PlayerIndex] ~= true
+                    and type(ArmorSkinSchedulePerspectiveFirstPersonRebind) == "function" then
+                    ArmorSkinSchedulePerspectiveFirstPersonRebind(PlayerIndex,
+                        tostring(Source or "local armor apply") .. " first-person settle")
+                end
+                return
+            end
+
+            if AttemptIndex >= #Gaps then
+                Log("ARMORSKIN P%d delayed apply exhausted color=%s source=%s info=%s",
+                    PlayerIndex, ArmorSkinColorLabel(ColorIndex), tostring(Source), tostring(Info))
+                if type(ArmorSkinV15AbortPending)=="function" then
+                    ArmorSkinV15AbortPending(PlayerIndex,ColorIndex,Source,Info)
+                end
+                return
+            end
+            QueueAttempt(AttemptIndex + 1)
+        end)
+    end
+
+    QueueAttempt(1)
+end
+
+function ArmorSkinRebindFirstPersonMIDs(PlayerIndex, Source)
+    PlayerIndex = math.max(1, math.min(2, tonumber(PlayerIndex) or 1))
+    if ModTeardownGuard or not MissionReady then return false, "mission unavailable" end
+    local ColorIndex = tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) or 0
+    if ColorIndex <= 0 then return false, "original green selected" end
+
+    local Controller = GetPlayer(PlayerIndex)
+    local Pawn = ArmorSkinGetPawnFromController(Controller)
+    if not IsValidObject(Pawn) then return false, "pawn unavailable" end
+    local PlayerId = ArmorSkinPlayerIdFromController(Controller)
+    local TargetKey = ArmorSkinTargetKey(PlayerId, PlayerIndex)
+    local State = ArmorSkinAppliedByTarget[TargetKey]
+
+    -- If the FP component instance changed (respawn/view reconstruction), use
+    -- the normal apply path; it already knows how to restore and rescan safely.
+    local CurrentArms, CurrentArmsKey, CurrentRoute = ArmorSkinFirstPersonAnchor(Pawn)
+    if type(State) ~= "table" or #(State.Items or {}) == 0 then
+        local Ok, Info = ArmorSkinApplyToPawn(Pawn, PlayerId, PlayerIndex, ColorIndex,
+            tostring(Source or "first-person bind") .. " missing-state rebuild")
+        return Ok, tostring(Info)
+    end
+    if IsValidObject(CurrentArms) and CurrentArmsKey ~= nil and State.FirstPersonArmsKey ~= nil
+        and tostring(CurrentArmsKey) ~= tostring(State.FirstPersonArmsKey) then
+        ArmorSkinDropTargetRuntimeRefs(TargetKey, "first-person component changed before rebind")
+        local Ok, Info = ArmorSkinApplyToPawn(Pawn, PlayerId, PlayerIndex, ColorIndex,
+            tostring(Source or "first-person bind") .. " changed-arms rebuild")
+        return Ok, tostring(Info)
+    end
+
+    local Texture, TexErr = ArmorSkinLoadTexture(ColorIndex)
+    if not IsValidObject(Texture) then return false, tostring(TexErr) end
+    local FirstPersonItems, Rebound, TextureSets, Failed, DetachedBefore = 0, 0, 0, 0, 0
+    for _, Item in ipairs(State.Items or {}) do
+        local ScopeLower = string.lower(tostring(Item.Scope or ""))
+        if string.find(ScopeLower, "first-person", 1, true) == 1 then
+            FirstPersonItems = FirstPersonItems + 1
+            if IsValidObject(Item.Component) and IsValidObject(Item.MID) then
+                local CurrentMaterial = nil
+                pcall(function() CurrentMaterial = Unwrap(Item.Component:GetMaterial(Item.Slot)) end)
+                local CurrentKey = ArmorSkinObjectKey(CurrentMaterial)
+                local MidKey = ArmorSkinObjectKey(Item.MID)
+                if CurrentKey == nil or MidKey == nil or tostring(CurrentKey) ~= tostring(MidKey) then
+                    DetachedBefore = DetachedBefore + 1
+                end
+
+                local TextureOk, TSet, NSet, VSet = ArmorSkinSetFirstPersonOverrides(Item.MID, Item.Params,
+                    Item.FPTextureParams, Item.FPVectorParams, Texture, ColorIndex)
+                local Count = (tonumber(TSet) or 0) + (tonumber(NSet) or 0) + (tonumber(VSet) or 0)
+                local BindOk = pcall(function() Item.Component:SetMaterial(Item.Slot, Item.MID) end)
+                if TextureOk and BindOk then
+                    Rebound = Rebound + 1
+                    TextureSets = TextureSets + Count
+                    ArmorSkinRefreshComponent(Item.Component)
+                else
+                    Failed = Failed + 1
+                end
+            else
+                Failed = Failed + 1
+            end
+        end
+    end
+
+    if FirstPersonItems <= 0 then
+        -- A candidate exists but the old state has no FP MIDs: let the existing
+        -- split-lifecycle code perform a safe rescan/rebuild.
+        local Ok, Info = ArmorSkinApplyToPawn(Pawn, PlayerId, PlayerIndex, ColorIndex,
+            tostring(Source or "first-person bind") .. " no-fp-items rebuild")
+        return Ok, tostring(Info)
+    end
+
+    Log("ARMORSKIN first-person MID rebind P%d color=%s items=%d rebound=%d detachedBefore=%d failed=%d textureSets=%d arms=%s route=%s source=%s",
+        PlayerIndex, ArmorSkinColorLabel(ColorIndex), FirstPersonItems, Rebound, DetachedBefore, Failed, TextureSets,
+        tostring(CurrentArmsKey or State.FirstPersonArmsKey or "unavailable"), tostring(CurrentRoute or State.FirstPersonRoute or "unavailable"),
+        tostring(Source or "first-person bind"))
+    return Rebound > 0 and Failed == 0, string.format("rebound=%d failed=%d detached=%d", Rebound, Failed, DetachedBefore)
+end
+
+function ArmorSkinSchedulePerspectiveFirstPersonRebind(PlayerIndex, Source)
+    PlayerIndex = math.max(1, math.min(2, tonumber(PlayerIndex) or 1))
+    ArmorSkinPerspectiveRebindToken[PlayerIndex] = (tonumber(ArmorSkinPerspectiveRebindToken[PlayerIndex]) or 0) + 1
+    local Token = ArmorSkinPerspectiveRebindToken[PlayerIndex]
+    local Delays = { 80, 350, 1200 }
+    for _, DelayMs in ipairs(Delays) do
+        local ThisDelay = DelayMs
+        ExecuteInGameThreadWithDelay(ThisDelay, function()
+            if ModTeardownGuard or Token ~= ArmorSkinPerspectiveRebindToken[PlayerIndex] or not MissionReady then return end
+            -- Cancel stale delayed work if the player has already gone back to
+            -- third person. Default/false is first person in the native helper.
+            if PerspectiveThirdPerson[PlayerIndex] == true then return end
+            ArmorSkinRebindFirstPersonMIDs(PlayerIndex,
+                string.format("%s +%dms", tostring(Source or "first-person presentation"), ThisDelay))
+        end)
+    end
+end
+
+function ArmorSkinScheduleNetworkApply(PlayerId, ColorIndex, Source)
+    PlayerId = tonumber(PlayerId)
+    ColorIndex = tonumber(ColorIndex)
+    if PlayerId == nil or ColorIndex == nil then return end
+    local Key = tostring(math.floor(PlayerId))
+    ArmorSkinNetworkPendingTokenByPlayerId[Key] = (tonumber(ArmorSkinNetworkPendingTokenByPlayerId[Key]) or 0) + 1
+    local Token = ArmorSkinNetworkPendingTokenByPlayerId[Key]
+    local Delays = { 0, 250, 900, 2500, 7000 }
+    for _, DelayMs in ipairs(Delays) do
+        local ThisDelay = DelayMs
+        ExecuteInGameThreadWithDelay(ThisDelay, function()
+            if ModTeardownGuard or ArmorSkinNetworkPendingTokenByPlayerId[Key] ~= Token then return end
+            if tonumber(ArmorSkinNetworkColorByPlayerId[Key]) ~= ColorIndex then return end
+            local Pawn, _, ResolveRoute = ArmorSkinResolvePawnByPlayerId(PlayerId)
+            if not IsValidObject(Pawn) then
+                if ThisDelay == Delays[#Delays] then
+                    Log("ARMORSKIN NET resolve exhausted playerId=%d color=%s source=%s route=%s",
+                        PlayerId, ArmorSkinColorLabel(ColorIndex), tostring(Source), tostring(ResolveRoute or "unresolved"))
+                end
+                return
+            end
+            -- V10: a host downlink may contain this client's own numeric PlayerId.
+            -- Never feed that pawn through the remote/TP-only cache path: it shares
+            -- the same P:<PlayerId> target key as local input and can poison a later
+            -- local hot-swap with a 19-TP-only cache. Classify exact local ids first.
+            local ApplyLocalIndex = ArmorSkinLocalPlayerIndexForPlayerId(PlayerId)
+            local Ok, Info = ArmorSkinApplyToPawn(Pawn, PlayerId, ApplyLocalIndex, ColorIndex, Source)
+            if Ok then
+                ArmorSkinNetworkPendingTokenByPlayerId[Key] = Token + 1
+                local PreviousRoute = ArmorSkinNetworkResolveRouteByPlayerId[Key]
+                if tostring(PreviousRoute or "") ~= tostring(ResolveRoute or "") then
+                    ArmorSkinNetworkResolveRouteByPlayerId[Key] = tostring(ResolveRoute or "unknown")
+                    Log("ARMORSKIN NET apply resolved playerId=%d color=%s route=%s pawn=%s",
+                        PlayerId, ArmorSkinColorLabel(ColorIndex), tostring(ResolveRoute or "unknown"),
+                        tostring(SafeFullName(Pawn) or Pawn))
+                end
+            elseif ThisDelay == Delays[#Delays] then
+                Log("ARMORSKIN NET delayed apply exhausted playerId=%d color=%s source=%s route=%s info=%s",
+                    PlayerId, ArmorSkinColorLabel(ColorIndex), tostring(Source), tostring(ResolveRoute or "unknown"), tostring(Info))
+            end
+        end)
+    end
+end
+
+-- RC3_43 same-fireteam cross-mission logical color carry -------------------
+function ArmorSkinPersistentRememberRemote(PlayerId, ColorIndex, OriginSlot, Source)
+    PlayerId=tonumber(PlayerId); ColorIndex=tonumber(ColorIndex); OriginSlot=tonumber(OriginSlot)
+    if PlayerId==nil or ColorIndex==nil or ColorIndex<0 or ColorIndex>#WarthogCEColors then return false end
+    local K=tostring(math.floor(PlayerId))
+    -- If the identity is currently local on this machine, its authoritative
+    -- persistence is ClassicArmorMenuSelectedByPlayer, not this remote cache.
+    if ArmorSkinLocalPlayerIndexForPlayerId(PlayerId)~=nil then
+        ArmorSkinPersistentRemoteColorByPlayerId[K]=nil
+        ArmorSkinPersistentRemoteOriginSlotByPlayerId[K]=nil
+        return false
+    end
+    local Old=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[K])
+    ArmorSkinPersistentRemoteColorByPlayerId[K]=ColorIndex
+    if OriginSlot==1 or OriginSlot==2 then ArmorSkinPersistentRemoteOriginSlotByPlayerId[K]=OriginSlot end
+    if Old~=ColorIndex then
+        Log("ARMORSKIN persistent remote color remembered playerId=%d originSlot=%s color=%s source=%s",
+            PlayerId,(OriginSlot==1 or OriginSlot==2) and ("P"..tostring(OriginSlot)) or "?",
+            ArmorSkinColorLabel(ColorIndex),tostring(Source or "network"))
+    end
+    return true
+end
+
+function ArmorSkinPersistentRestoreRemoteStates(Source)
+    if not MissionReady then return 0 end
+    local Records=ArmorSkinAllKnownPlayerPawnRecords()
+    if type(Records)~="table" or #Records==0 then return 0 end
+    local Restored=0
+    local Present={}
+    for _,R in ipairs(Records) do
+        local Pid=tonumber(R.PlayerId)
+        if Pid~=nil then
+            local K=tostring(math.floor(Pid)); Present[K]=true
+            if R.LocalIndex==nil then
+                local C=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[K])
+                if C~=nil and C>=0 and C<=#WarthogCEColors then
+                    ArmorSkinNetworkColorByPlayerId[K]=C
+                    local S=tonumber(ArmorSkinPersistentRemoteOriginSlotByPlayerId[K])
+                    if S==1 or S==2 then ArmorSkinNetworkOriginSlotByPlayerId[K]=S end
+                    Restored=Restored+1
+                end
+            else
+                -- Never let a stale remote-cache entry shadow a now-local player.
+                ArmorSkinPersistentRemoteColorByPlayerId[K]=nil
+                ArmorSkinPersistentRemoteOriginSlotByPlayerId[K]=nil
+            end
+        end
+    end
+    local G=tonumber(WarthogColorRuntimeGeneration) or 0
+    if Restored>0 and tonumber(ArmorSkinPersistentRestoreAuditGeneration)~=G then
+        ArmorSkinPersistentRestoreAuditGeneration=G
+        local Parts={}
+        for _,R in ipairs(Records) do
+            if R.LocalIndex==nil and R.PlayerId~=nil then
+                local K=tostring(math.floor(tonumber(R.PlayerId)))
+                local C=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[K])
+                if C~=nil then
+                    local S=tonumber(ArmorSkinPersistentRemoteOriginSlotByPlayerId[K])
+                    Parts[#Parts+1]=string.format("%s/P%s=%s",K,(S==1 or S==2) and tostring(S) or "?",ArmorSkinColorLabel(C))
+                end
+            end
+        end
+        Log("ARMORSKIN persistent remote restore count=%d generation=%d source=%s states=%s",
+            Restored,G,tostring(Source or "mission"),#Parts>0 and table.concat(Parts," | ") or "-")
+    end
+    return Restored
+end
+
+-- RC3_52: the client->host color can be remembered correctly while the new
+-- mission's remote presentation biped is still constructing.  Poll only the
+-- already-known player records and the safe biped resolver at a modest cadence
+-- until every non-green persistent remote color has been applied.  This is
+-- deliberately bounded and contains no reflection/order/suffix guessing.
+ArmorSkinMissionCarryRemoteRetryGeneration = ArmorSkinMissionCarryRemoteRetryGeneration or -1
+ArmorSkinMissionCarryRemoteSettledGeneration = ArmorSkinMissionCarryRemoteSettledGeneration or -1
+
+function ArmorSkinMissionCarryIdentityReady(Records)
+    local LocalCount,Anchored,RemoteCount=0,0,0
+    for _,R in ipairs(type(Records)=="table" and Records or {}) do
+        if R.LocalIndex~=nil then
+            LocalCount=LocalCount+1
+            local Pawn=Unwrap(R.Pawn)
+            if not IsValidObject(Pawn) and tonumber(R.LocalIndex) then
+                Pawn=ArmorSkinGetPawnFromController(GetPlayer(tonumber(R.LocalIndex)))
+            end
+            if IsValidObject(Pawn) and IsValidObject(ArmorSkinDirectBipedChild(Pawn)) then Anchored=Anchored+1 end
+        else
+            RemoteCount=RemoteCount+1
+        end
+    end
+    if RemoteCount<=0 then return true end
+    if LocalCount<=0 or Anchored<LocalCount then return false end
+    if RemoteCount==1 then return true end
+    if RemoteCount==2 then
+        local V=ArmorSkinRemotePairVector
+        return type(V)=="table" and tonumber(V.Generation)==(tonumber(WarthogColorRuntimeGeneration) or 0)
+    end
+    return false
+end
+
+function ArmorSkinScheduleMissionCarryRemoteReapply(Source)
+    if not MissionReady then return false end
+    local G=tonumber(WarthogColorRuntimeGeneration) or 0
+    if tonumber(ArmorSkinMissionCarryRemoteRetryGeneration)==G then return false end
+    ArmorSkinMissionCarryRemoteRetryGeneration=G
+    ArmorSkinMissionCarryRemoteSettledGeneration=-1
+    local Delays={700,2500,7000,15000,30000}
+    for _,DelayMs in ipairs(Delays) do
+        local ThisDelay=DelayMs
+        ExecuteInGameThreadWithDelay(ThisDelay,function()
+            if ModTeardownGuard or not MissionReady or (tonumber(WarthogColorRuntimeGeneration) or 0)~=G then return end
+            if tonumber(ArmorSkinMissionCarryRemoteSettledGeneration)==G then return end
+            ArmorSkinPersistentRestoreRemoteStates(string.format("mission-carry retry +%dms",ThisDelay))
+            local Records=ArmorSkinAllKnownPlayerPawnRecords()
+            local Needed,Applied=0,0
+            local IdentityReady=ArmorSkinMissionCarryIdentityReady(Records)
+            for _,R in ipairs(type(Records)=="table" and Records or {}) do
+                local Pid=tonumber(R.PlayerId)
+                if R.LocalIndex==nil and Pid~=nil then
+                    local K=tostring(math.floor(Pid))
+                    local C=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[K])
+                    if C~=nil and C>0 and C<=#WarthogCEColors then
+                        Needed=Needed+1
+                        ArmorSkinNetworkColorByPlayerId[K]=C
+                        local S=tonumber(ArmorSkinPersistentRemoteOriginSlotByPlayerId[K])
+                        if S==1 or S==2 then ArmorSkinNetworkOriginSlotByPlayerId[K]=S end
+                        if IdentityReady then
+                            local Pawn=Unwrap(R.Pawn)
+                            if not IsValidObject(Pawn) then Pawn=select(1,ArmorSkinResolvePawnByPlayerId(Pid)) end
+                            if IsValidObject(Pawn) then
+                                local Ok=ArmorSkinApplyToPawn(Pawn,Pid,nil,C,string.format("mission-carry remote reapply +%dms",ThisDelay))
+                                if Ok then Applied=Applied+1 end
+                            end
+                        end
+                    end
+                end
+            end
+            if Needed>0 and Applied>=Needed then
+                ArmorSkinMissionCarryRemoteSettledGeneration=G
+                Log("ARMORSKIN mission-carry remote settled generation=%d applied=%d delay=%dms source=%s",G,Applied,ThisDelay,tostring(Source or "mission"))
+            elseif ThisDelay==Delays[#Delays] and Needed>0 then
+                Log("ARMORSKIN mission-carry remote retry exhausted generation=%d applied=%d/%d identityReady=%s source=%s",G,Applied,Needed,tostring(IdentityReady),tostring(Source or "mission"))
+            end
+        end)
+    end
+    return true
+end
+
+-- v1.11.0 native Classic12 cleanup ------------------------------------------
+-- The retired vehicle-style Classic armor RPC transport (HCECEA*) has been
+-- removed. Classic armor is now selected through cooked native customization
+-- rows, so Halo owns replication just like ordinary armor/customization.
+-- Keep only this generic local-id helper because dormant local presentation
+-- helpers still use it for exact local-vs-remote classification.
+function ArmorSkinLocalPlayerIndexForPlayerId(PlayerId)
+    PlayerId=tonumber(PlayerId); if PlayerId==nil then return nil end
+    for I=1,2 do
+        local C=GetPlayer(I)
+        if tonumber(ArmorSkinPlayerIdFromController(C))==PlayerId then return I end
+    end
+    return nil
+end
+
+function ArmorSkinPrepareForModelSwap(PlayerIndex, Source)
+    if type(ClassicArmorPendingCommitByPlayer)=="table" then
+        ClassicArmorPendingCommitByPlayer[PlayerIndex]=nil
+    end
+    local Previous = tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) or 0
+    local WasDefault = select(1, ArmorSkinCurrentModelIsDefault(PlayerIndex))
+    if WasDefault and ArmorCatalog ~= nil then
+        local CurrentCatalogIndex = tonumber(CatalogIndex[PlayerIndex])
+        if CurrentCatalogIndex ~= nil and ArmorCatalog[CurrentCatalogIndex] ~= nil then
+            ArmorSkinDefaultCatalogIndex = CurrentCatalogIndex
+            Log("ARMORSKIN learned default Spartan catalog entry=%d before model swap skin=%s",
+                CurrentCatalogIndex, tostring(ArmorCatalog[CurrentCatalogIndex].Skin))
+        end
+    end
+    local Controller = GetPlayer(PlayerIndex)
+    local PlayerId = ArmorSkinPlayerIdFromController(Controller)
+    local TargetKey = ArmorSkinTargetKey(PlayerId, PlayerIndex)
+    ArmorSkinLocalApplyToken[PlayerIndex] = (tonumber(ArmorSkinLocalApplyToken[PlayerIndex]) or 0) + 1
+    ArmorSkinLocalSettledToken[PlayerIndex] = 0
+    ArmorSkinRestoreTarget(TargetKey, "armor model swap")
+    ClassicArmorSetPersistentSelection(PlayerIndex, 0, Source or "armor model swap")
+    if Previous ~= 0 then
+        Log("ARMORSKIN P%d reset to ORIGINAL GREEN before separate armor-model swap", PlayerIndex)
+    end
+end
+
+function ArmorSkinTraceAnyVehicle(Object)
+    local Current = Unwrap(Object)
+    local Seen = {}
+    for _ = 1, 8 do
+        if not IsValidObject(Current) then return nil end
+        local Token = SafeFullName(Current) or tostring(Current)
+        if Seen[Token] then return nil end
+        Seen[Token] = true
+        local Lower = string.lower(tostring(Token or ""))
+        if string.find(Lower, "vehicleactor", 1, true) ~= nil or
+           string.find(Lower, "vehicle_actor", 1, true) ~= nil then
+            return Current
+        end
+
+        local Owner = nil
+        pcall(function() Owner = Unwrap(Current:GetOwner()) end)
+        if IsValidObject(Owner) then
+            local OwnerName = string.lower(tostring(SafeFullName(Owner) or ""))
+            if string.find(OwnerName, "vehicleactor", 1, true) ~= nil or
+               string.find(OwnerName, "vehicle_actor", 1, true) ~= nil then
+                return Owner
+            end
+        end
+
+        local Parent = nil
+        pcall(function() Parent = Unwrap(Current:GetAttachParent()) end)
+        if not IsValidObject(Parent) then pcall(function() Parent = Unwrap(Current.AttachParent) end) end
+        if not IsValidObject(Parent) then pcall(function() Parent = Unwrap(Current:GetAttachParentActor()) end) end
+        if not IsValidObject(Parent) then return nil end
+        Current = Parent
+    end
+    return nil
+end
+
+function ArmorSkinPlayerInAnyVehicle(PlayerIndex)
+    local Controller = GetPlayer(PlayerIndex)
+    local Pawn = ArmorSkinGetPawnFromController(Controller)
+    if not IsValidObject(Pawn) then return false, "pawn unavailable" end
+
+    for _, Source in ipairs({ Controller, Pawn }) do
+        for _, Name in ipairs({ "DrivingVehicle", "DrivenVehicle", "CurrentVehicle", "Vehicle", "MountedVehicle" }) do
+            local Value = nil
+            pcall(function() Value = Unwrap(Source[Name]) end)
+            if IsValidObject(Value) then
+                local Text = string.lower(tostring(SafeFullName(Value) or ""))
+                local Warthog, Scorpion = nil, nil
+                pcall(function() Warthog = WarthogResolveVehicleFromObject(Value) end)
+                pcall(function() Scorpion = ScorpionResolveVehicleFromObject(Value) end)
+                local AnyVehicle = ArmorSkinTraceAnyVehicle(Value)
+                if string.find(Text, "vehicle", 1, true) ~= nil or IsValidObject(Warthog) or
+                   IsValidObject(Scorpion) or IsValidObject(AnyVehicle) then
+                    return true, tostring(Name)
+                end
+            end
+        end
+    end
+
+    local Components = WarthogGetActorComponents(Pawn) or {}
+    local MaxComponents = math.min(#Components, 96)
+    for I = 1, MaxComponents do
+        local Component = Unwrap(Components[I])
+        if IsValidObject(Component) then
+            local Warthog = nil
+            pcall(function() Warthog = select(1, WarthogTraceAttachmentChain(Component, "armor-skin occupancy")) end)
+            if IsValidObject(Warthog) then return true, "Warthog attachment" end
+            local Scorpion = nil
+            pcall(function() Scorpion = select(1, ScorpionTraceAttachmentChain(Component)) end)
+            if IsValidObject(Scorpion) then return true, "Scorpion attachment" end
+            local AnyVehicle = ArmorSkinTraceAnyVehicle(Component)
+            if IsValidObject(AnyVehicle) then
+                return true, "generic vehicle attachment: " .. tostring(SafeFullName(AnyVehicle) or AnyVehicle)
+            end
+        end
+    end
+    return false, "on foot"
+end
+
+function CycleDefaultSpartanSkin(PlayerIndex, Delta, Source)
+    if not MissionReady then return false end
+    local Controller = GetPlayer(PlayerIndex)
+    if not IsValidObject(Controller) then return false end
+
+    local IsDefault = select(1, ArmorSkinCurrentModelIsDefault(PlayerIndex))
+    if not IsDefault then
+        -- A non-default authored armor model has no HCEChief skin state. Start its
+        -- skin gesture from ORIGINAL GREEN so next/previous is deterministic.
+        ArmorSkinPrepareForModelSwap(PlayerIndex, "skin input from non-default model")
+    end
+
+    local Current = tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) or 0
+    local Step = (tonumber(Delta) or 1) < 0 and -1 or 1
+    local Next = Current + Step
+    if Next > #WarthogCEColors then Next = 0 end
+    if Next < 0 then Next = #WarthogCEColors end
+
+    local TextureReady = true
+    local TextureError = nil
+    if Next > 0 then
+        local Texture, TexErr = ArmorSkinLoadTexture(Next)
+        TextureReady = IsValidObject(Texture)
+        TextureError = TexErr
+        if not TextureReady then
+            local NetworkClientCanPublish = LivesAuthorityResolved and LivesNetworkClientBlocked == true
+                and ArmorSkinHostCapabilitySeen == true and VehicleMessageUplinkReady == true
+            if not NetworkClientCanPublish then
+                ScreenMessage(PlayerIndex, Controller, "ARMOR SKIN ASSETS MISSING - SEE UE4SS.LOG")
+                Log("ARMORSKIN P%d cycle blocked color=%s error=%s", PlayerIndex, ArmorSkinColorLabel(Next), tostring(TexErr))
+                return false
+            end
+            Log("ARMORSKIN P%d network-client cycle continuing with deferred local texture color=%s error=%s",
+                PlayerIndex, ArmorSkinColorLabel(Next), tostring(TexErr))
+        end
+    end
+
+    local DefaultOk, ModelChanged, DefaultInfo = ArmorSkinEnsureDefaultModel(PlayerIndex, Source)
+    if not DefaultOk then
+        ScreenMessage(PlayerIndex, Controller, "ARMOR SKIN: DEFAULT SPARTAN UNAVAILABLE")
+        Log("ARMORSKIN P%d default-model fallback failed source=%s info=%s", PlayerIndex, tostring(Source), tostring(DefaultInfo))
+        return false
+    end
+
+    ClassicArmorSetPersistentSelection(PlayerIndex, Next, Source or "skin cycle")
+    ArmorSkinScheduleLocalApply(PlayerIndex, Next, Source or "skin cycle", ModelChanged)
+    local Ordinal = Next + 1
+    local Total = #WarthogCEColors + 1
+    ScreenMessage(PlayerIndex, Controller,
+        string.format("P%d ARMOR SKIN %02d/%02d: %s", PlayerIndex, Ordinal, Total, ArmorSkinColorLabel(Next)))
+    Log("ARMORSKIN P%d cycle source=%s current=%d next=%d label=%s modelChanged=%s",
+        PlayerIndex, tostring(Source), Current, Next, ArmorSkinColorLabel(Next), tostring(ModelChanged == true))
+    return true
+end
+
+-- Classic menu rows intentionally retain the stock Default tag. The game can
+-- therefore perform its usual model/entitlement work, while this handler owns
+-- only the free CE color overlay.
+ClassicArmorMenuSelectedByPlayer = ClassicArmorMenuSelectedByPlayer or { [1] = 0, [2] = 0 }
+ClassicArmorMenuActivationHookReady = ClassicArmorMenuActivationHookReady or false
+ClassicArmorMenuLastPlayerIndex = ClassicArmorMenuLastPlayerIndex or 1
+ClassicArmorMenuSelectionSyncGuard = ClassicArmorMenuSelectionSyncGuard or false
+ClassicArmorMenuReplayByWidget = ClassicArmorMenuReplayByWidget or {}
+ClassicArmorMenuReplayGuard = ClassicArmorMenuReplayGuard or false
+ClassicArmorMenuPostReplayTokenByWidget = ClassicArmorMenuPostReplayTokenByWidget or {}
+
+function ClassicArmorMenuColorIndex(Entry)
+    Entry = Unwrap(Entry)
+    local FullName = tostring(SafeFullName(Entry) or "")
+    local Name = string.match(string.upper(FullName), "DA_HCECLASSIC_([A-Z]+)")
+    if Name == nil then return nil, nil end
+    for Index, Color in ipairs(WarthogCEColors) do
+        if Color.Name == Name then return Index, Name end
+    end
+    return nil, Name
+end
+
+function ClassicArmorMenuPlayerIndex(Controller)
+    Controller = Unwrap(Controller)
+    local CandidateName = tostring(SafeFullName(Controller) or "")
+    for PlayerIndex = 1, 2 do
+        local Player = GetPlayer(PlayerIndex)
+        if IsValidObject(Player) and CandidateName ~= "" and CandidateName == tostring(SafeFullName(Player) or "") then
+            return PlayerIndex
+        end
+    end
+    local ControllerId = nil
+    pcall(function()
+        if IsValidObject(Controller) and IsValidObject(Controller.Player) then
+            ControllerId = tonumber(Unwrap(Controller.Player.ControllerId))
+        end
+    end)
+    if ControllerId == 1 then return 2 end
+    return 1
+end
+
+function ApplyClassicArmorSkin(PlayerIndex, ColorIndex, Source)
+    PlayerIndex = tonumber(PlayerIndex) or 1
+    ColorIndex = tonumber(ColorIndex)
+    if ColorIndex == nil or ColorIndex < 1 or ColorIndex > #WarthogCEColors then return false end
+
+    local Texture, TextureError = ArmorSkinLoadTexture(ColorIndex)
+    if not IsValidObject(Texture) then
+        Log("CLASSIC menu selection blocked color=%s error=%s", ArmorSkinColorLabel(ColorIndex), tostring(TextureError))
+        return false
+    end
+
+    -- Keep the selection through the frontend-to-mission boundary. The runtime
+    -- reset restores this value and the ordinary mission-ready reapply path then
+    -- paints the newly constructed Default Spartan.
+    ClassicArmorSetPersistentSelection(PlayerIndex, ColorIndex, Source or "Classic menu")
+
+    if not MissionReady then
+        Log("CLASSIC menu selected P%d color=%s source=%s state=deferred-until-mission",
+            PlayerIndex, ArmorSkinColorLabel(ColorIndex), tostring(Source or "Classic menu"))
+        return true
+    end
+
+    local DefaultOk, ModelChanged, Info = ArmorSkinEnsureDefaultModel(PlayerIndex, Source or "Classic menu")
+    if not DefaultOk then
+        Log("CLASSIC menu P%d apply deferred color=%s info=%s", PlayerIndex, ArmorSkinColorLabel(ColorIndex), tostring(Info))
+        return false
+    end
+    ArmorSkinScheduleLocalApply(PlayerIndex, ColorIndex, Source or "Classic menu", ModelChanged)
+    Log("CLASSIC menu applied P%d color=%s modelChanged=%s", PlayerIndex,
+        ArmorSkinColorLabel(ColorIndex), tostring(ModelChanged == true))
+    return true
+end
+
+function RegisterClassicArmorMenuActivationHook()
+    if ClassicArmorMenuActivationHookReady then return true end
+    local Ok, Err = pcall(function()
+        RegisterHook(
+            "/Game/UI/Frontend/Customization/Widgets/WBP_CustomizationList.WBP_CustomizationList_C:HandleItemActivated",
+            function(Context, Controller, LocalUserIndex, Entry)
+                if InternalApply then return end
+                local ColorIndex, ColorName = ClassicArmorMenuColorIndex(Entry)
+                local PlayerIndex = ClassicArmorMenuPlayerIndex(Controller)
+                -- UE4SS hook parameter wrappers are transient. Keep only the
+                -- object's stable full name across delayed callbacks, then resolve
+                -- a fresh live UObject instead of retaining Context itself.
+                local MenuKey = tostring(SafeFullName(Unwrap(Context)) or "")
+                ClassicArmorMenuLastPlayerIndex = PlayerIndex
+                if ColorIndex == nil then
+                    local SkinName = ""
+                    pcall(function() SkinName = string.lower(GetTagName(Unwrap(Entry).SkinGameplayTag) or "") end)
+                    if string.find(SkinName, "blam.customization.masterchief.", 1, true) == 1 then
+                        ClassicArmorSetPersistentSelection(PlayerIndex, 0, "normal armor menu selection")
+                    end
+                    return
+                end
+
+                -- Record the choice before the stock handler rebuilds selection from
+                -- the shared Default tag. The delayed apply still owns persistence
+                -- and the mission-side color overlay.
+                ClassicArmorSetPersistentSelection(PlayerIndex, ColorIndex, "Classic menu activation")
+                ExecuteInGameThreadWithDelay(120, function()
+                    ApplyClassicArmorSkin(PlayerIndex, ColorIndex, "Classic menu " .. tostring(ColorName))
+                end)
+                for _, DelayMs in ipairs({ 160, 360, 900 }) do
+                    ExecuteInGameThreadWithDelay(DelayMs, function()
+                        local Menu = ClassicArmorFindLiveMenuByKey(MenuKey)
+                        if IsValidObject(Menu) and ClassicArmorMenuIsArmor(Menu) then
+                            ClassicArmorSyncMenuSelection(Menu, PlayerIndex, "Classic activation")
+                        end
+                    end)
+                end
+            end,
+            function(Context, Controller, LocalUserIndex, Entry) end
+        )
+    end)
+    if Ok then
+        ClassicArmorMenuActivationHookReady = true
+        Log("CLASSIC menu activation hook ready; free CE entries map to Default Spartan only")
+        return true
+    end
+    Log("CLASSIC menu activation hook unavailable: %s", tostring(Err))
+    return false
+end
+
+ClassicArmorMenuEntryPaths = {
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_BLACK",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_RED",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_BLUE",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_GRAY",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_YELLOW",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_GREEN",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_PINK",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_PURPLE",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_CYAN",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_COBALT",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_ORANGE",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_TEAL",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_SAGE",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_BROWN",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_TAN",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_MAROON",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_SALMON",
+    "/Game/Mods/HCEClassicArmor/Entries/DA_HCEClassic_WHITE",
+}
+ClassicArmorMenuListListenerReady = ClassicArmorMenuListListenerReady or false
+ClassicArmorMenuRefreshHookReady = ClassicArmorMenuRefreshHookReady or false
+ClassicArmorMenuBlueprintRefreshHookReady = ClassicArmorMenuBlueprintRefreshHookReady or false
+ClassicArmorMenuListResetHookReady = ClassicArmorMenuListResetHookReady or false
+ClassicArmorMenuResetSignalQueued = ClassicArmorMenuResetSignalQueued or false
+ClassicArmorMenuVisibilityHookReady = ClassicArmorMenuVisibilityHookReady or false
+ClassicArmorMenuAddItemHookReady = ClassicArmorMenuAddItemHookReady or false
+ClassicArmorMenuAddItemGuard = ClassicArmorMenuAddItemGuard or false
+ClassicArmorMenuRefreshGeneration = ClassicArmorMenuRefreshGeneration or 0
+ClassicArmorMenuInjectedByWidget = ClassicArmorMenuInjectedByWidget or {}
+ClassicArmorMenuRefreshPendingByWidget = ClassicArmorMenuRefreshPendingByWidget or {}
+ClassicArmorMenuEntryCache = ClassicArmorMenuEntryCache or {}
+
+function ClassicLoadMenuEntry(Path)
+    local Cached = ClassicArmorMenuEntryCache[Path]
+    if IsValidObject(Cached) then return Cached, Path .. " (cached)" end
+    local AssetName = string.match(tostring(Path or ""), "([^/]+)$")
+    local Candidates = { Path }
+    if AssetName ~= nil and AssetName ~= "" then
+        Candidates[#Candidates + 1] = tostring(Path) .. "." .. AssetName
+    end
+    for _, Candidate in ipairs(Candidates) do
+        local Entry = nil
+        pcall(function() Entry = Unwrap(LoadAsset(Candidate)) end)
+        if IsValidObject(Entry) then
+            ClassicArmorMenuEntryCache[Path] = Entry
+            return Entry, Candidate
+        end
+        pcall(function() Entry = Unwrap(StaticFindObject(Candidate)) end)
+        if IsValidObject(Entry) then
+            ClassicArmorMenuEntryCache[Path] = Entry
+            return Entry, Candidate
+        end
+    end
+    return nil, nil
+end
+
+function ClassicArmorListViewIsArmor(ListView)
+    ListView = Unwrap(ListView)
+    if not IsValidObject(ListView) then return false end
+    local Items = nil
+    local Ok = pcall(function() Items = ListView:GetListItems() end)
+    if not Ok or Items == nil then return false end
+    for _, Value in ipairs(ArrayValues(Items)) do
+        local Entry = Unwrap(Value)
+        local Skin = ""
+        pcall(function() Skin = string.lower(GetTagName(Entry.SkinGameplayTag) or "") end)
+        if string.find(Skin, "blam.customization.masterchief.", 1, true) == 1 then
+            return true
+        end
+        if string.find(Skin, "blam.customization.", 1, true) == 1 then
+            return false
+        end
+    end
+    return false
+end
+
+function ClassicArmorMenuIsArmor(Menu)
+    Menu = Unwrap(Menu)
+    if not IsValidObject(Menu) then return false end
+    local ListView = nil
+    pcall(function() ListView = Unwrap(Menu.CustomizationListView) end)
+    return ClassicArmorListViewIsArmor(ListView)
+end
+
+function ClassicArmorFindLiveMenuByKey(MenuKey)
+    MenuKey = tostring(MenuKey or "")
+    if MenuKey == "" then return nil end
+    local Menus = FindAllOf("WBP_CustomizationList_C") or {}
+    for _, RawMenu in ipairs(ArrayValues(Menus)) do
+        local Menu = Unwrap(RawMenu)
+        if IsValidObject(Menu) and tostring(SafeFullName(Menu) or "") == MenuKey then
+            return Menu
+        end
+    end
+    return nil
+end
+
+function ClassicMenuEntryDisplayName(Entry)
+    local Name = ""
+    pcall(function() Name = SafeToString(Unwrap(Entry).EntryName) end)
+    return WeaponSkinFriendlyName(Name, "")
+end
+
+function ClassicMenuHasInjectedRows(ListView)
+    local Items = nil
+    local Ok = pcall(function() Items = ListView:GetListItems() end)
+    if not Ok or Items == nil then return false end
+    for _, Value in ipairs(ArrayValues(Items)) do
+        local FullName = tostring(SafeFullName(Unwrap(Value)) or "")
+        if string.find(FullName, "DA_HCEClassic_BLACK", 1, true) ~= nil then return true end
+    end
+    return false
+end
+
+function ClassicArmorEntryObjectKey(Entry)
+    Entry = Unwrap(Entry)
+    if not IsValidObject(Entry) then return "" end
+    return tostring(SafeFullName(Entry) or "")
+end
+
+function ClassicArmorGetListItemObjectFromWidget(Widget)
+    Widget = Unwrap(Widget)
+    if not IsValidObject(Widget) then return nil, "widget unavailable" end
+
+    local Library = nil
+    pcall(function() Library = StaticFindObject("/Script/UMG.Default__UserObjectListEntryLibrary") end)
+    if IsValidObject(Library) then
+        local Item = nil
+        local Ok = pcall(function() Item = Unwrap(Library:GetListItemObject(Widget)) end)
+        if Ok and IsValidObject(Item) then return Item, "UserObjectListEntryLibrary" end
+    end
+
+    -- Blueprint wrappers sometimes expose the assigned object directly. Try a
+    -- short allow-list rather than reflecting arbitrary fields every refresh.
+    for _, Name in ipairs({"ListItemObject", "ItemObject", "ListItem", "Item", "Data", "EntryData"}) do
+        local Item = nil
+        pcall(function() Item = Unwrap(Widget[Name]) end)
+        if IsValidObject(Item) then return Item, "Widget." .. Name end
+    end
+    return nil, "unresolved"
+end
+
+function ClassicArmorBuildDisplayedWidgetMap(ListView)
+    ListView = Unwrap(ListView)
+    local Map = {}
+    if not IsValidObject(ListView) then return Map, 0, 0, "list unavailable" end
+    local Widgets = nil
+    local Route = "GetDisplayedEntryWidgets"
+    local Ok = pcall(function() Widgets = ListView:GetDisplayedEntryWidgets() end)
+    if not Ok or Widgets == nil then
+        Route = "BP_GetDisplayedEntryWidgets"
+        pcall(function() Widgets = ListView:BP_GetDisplayedEntryWidgets() end)
+    end
+    local Values = ArrayValues(Widgets)
+    local Mapped = 0
+    for _, RawWidget in ipairs(Values) do
+        local Widget = Unwrap(RawWidget)
+        if IsValidObject(Widget) then
+            local Item, ItemRoute = ClassicArmorGetListItemObjectFromWidget(Widget)
+            local Key = ClassicArmorEntryObjectKey(Item)
+            if Key ~= "" then
+                Map[Key] = Widget
+                Map[Key .. "#route"] = ItemRoute
+                Mapped = Mapped + 1
+            end
+        end
+    end
+    return Map, #Values, Mapped, Route
+end
+
+function ClassicArmorCheckmarkChildCandidates(Widget)
+    Widget = Unwrap(Widget)
+    local Result, Seen = {}, {}
+    if not IsValidObject(Widget) then return Result end
+
+    local function Add(Value, Why)
+        Value = Unwrap(Value)
+        if not IsValidObject(Value) then return end
+        local Key = tostring(SafeFullName(Value) or tostring(Value))
+        if Seen[Key] then return end
+        Seen[Key] = true
+        Result[#Result + 1] = { Widget = Value, Why = Why }
+    end
+
+    -- Common authored names first, even if WidgetTree enumeration is unavailable.
+    for _, Name in ipairs({"Equipped", "EquippedIcon", "EquippedImage", "EquippedIndicator",
+                           "Checkmark", "CheckMark", "CheckmarkImage", "CheckImage", "Image_Equipped"}) do
+        local Value = nil
+        pcall(function() Value = Widget[Name] end)
+        if IsValidObject(Value) then Add(Value, "field:" .. Name) end
+    end
+
+    local Tree = nil
+    pcall(function() Tree = Unwrap(Widget.WidgetTree) end)
+    local Children = nil
+    if IsValidObject(Tree) then pcall(function() Children = Tree:GetAllWidgets() end) end
+    for I, RawChild in ipairs(ArrayValues(Children)) do
+        if I > 128 then break end
+        local Child = Unwrap(RawChild)
+        if IsValidObject(Child) then
+            local Desc = string.lower(ArmorSkinObjectDescriptionForDetection(Child))
+            local LooksLikeCheck = string.find(Desc, "equip", 1, true) ~= nil
+                or string.find(Desc, "checkmark", 1, true) ~= nil
+                or string.find(Desc, "check_mark", 1, true) ~= nil
+                or string.find(Desc, "checkimage", 1, true) ~= nil
+            if LooksLikeCheck then Add(Child, "tree-name") end
+        end
+    end
+    return Result
+end
+
+function ClassicArmorForceCheckmarkVisual(Widget, Wanted)
+    Widget = Unwrap(Widget)
+    if not IsValidObject(Widget) then return 0 end
+    local Count = 0
+    local Visibility = Wanted and 0 or 1 -- ESlateVisibility Visible / Collapsed
+    local Opacity = Wanted and 1.0 or 0.0
+    for _, Candidate in ipairs(ClassicArmorCheckmarkChildCandidates(Widget)) do
+        local Child = Unwrap(Candidate.Widget)
+        local Changed = false
+        if IsValidObject(Child) then
+            local Ok = pcall(function() Child:SetVisibility(Visibility) end)
+            Changed = Changed or Ok
+            Ok = pcall(function() Child:SetRenderOpacity(Opacity) end)
+            Changed = Changed or Ok
+            Ok = pcall(function() Child:SetIsChecked(Wanted) end)
+            Changed = Changed or Ok
+        end
+        if Changed then Count = Count + 1 end
+    end
+    return Count
+end
+
+function ClassicArmorSetEntryVisualSelected(ListView, Entry, Selected, DisplayedMap)
+    ListView = Unwrap(ListView)
+    Entry = Unwrap(Entry)
+    if not IsValidObject(ListView) or not IsValidObject(Entry) then return false, 0, "invalid" end
+    local EntryKey = ClassicArmorEntryObjectKey(Entry)
+    local Widget = nil
+    local Route = "BP_GetEntryWidgetFromItem"
+    pcall(function() Widget = Unwrap(ListView:BP_GetEntryWidgetFromItem(Entry)) end)
+    if not IsValidObject(Widget) then
+        Route = "GetEntryWidgetFromItem"
+        pcall(function() Widget = Unwrap(ListView:GetEntryWidgetFromItem(Entry)) end)
+    end
+    if not IsValidObject(Widget) and type(DisplayedMap) == "table" then
+        Widget = Unwrap(DisplayedMap[EntryKey])
+        Route = tostring(DisplayedMap[EntryKey .. "#route"] or "displayed-widget-map")
+    end
+    if not IsValidObject(Widget) then return false, 0, "widget-not-materialized" end
+
+    local Wanted = Selected == true
+    local Applied = false
+    local Ok = pcall(function() Widget:BP_OnItemSelectionChanged(Wanted) end)
+    Applied = Applied or Ok
+    Ok = pcall(function() Widget:SetIsSelected(Wanted) end)
+    Applied = Applied or Ok
+    if not Ok then
+        Ok = pcall(function() Widget:SetIsSelected(Wanted, false) end)
+        Applied = Applied or Ok
+    end
+    Ok = pcall(function() Widget:SetIsEquipped(Wanted) end)
+    Applied = Applied or Ok
+    Ok = pcall(function() Widget:SetEquipped(Wanted) end)
+    Applied = Applied or Ok
+    Ok = pcall(function() Widget:BP_SetEquipped(Wanted) end)
+    Applied = Applied or Ok
+
+    -- The game's actual equipped Spartan remains Default green, so its stock
+    -- equipped indicator is expected to say green even though our Classic color
+    -- is a texture-only overlay. Explicitly mirror the remembered color onto the
+    -- visible check/equipped child and hide it on the stock Default row.
+    local Forced = ClassicArmorForceCheckmarkVisual(Widget, Wanted)
+    return Applied or Forced > 0, Forced, Route
+end
+
+function ClassicArmorReplayExactSelection(Menu, PlayerIndex, TargetEntry, Source)
+    if ClassicArmorMenuReplayGuard or ModTeardownGuard then return false, "guarded" end
+    Menu = Unwrap(Menu)
+    TargetEntry = Unwrap(TargetEntry)
+    PlayerIndex = tonumber(PlayerIndex) or 1
+    if not IsValidObject(Menu) or not IsValidObject(TargetEntry) then return false, "invalid menu/entry" end
+
+    local ColorIndex = ClassicArmorMenuColorIndex(TargetEntry)
+    if ColorIndex == nil then return false, "not a Classic row" end
+    local MenuKey = tostring(SafeFullName(Menu) or "")
+    if MenuKey == "" then return false, "menu key unavailable" end
+    if tonumber(ClassicArmorMenuReplayByWidget[MenuKey]) == tonumber(ColorIndex) then
+        return true, "already-replayed"
+    end
+
+    local Controller = GetPlayer(PlayerIndex)
+    if not IsValidObject(Controller) then return false, "player controller unavailable" end
+    local LocalUserIndex = math.max(0, PlayerIndex - 1)
+    local WasInternalApply = InternalApply == true
+    ClassicArmorMenuReplayGuard = true
+    InternalApply = true
+    local Started = os.clock()
+    local Ok, Err = pcall(function()
+        Menu:HandleItemActivated(Controller, LocalUserIndex, TargetEntry)
+    end)
+    InternalApply = WasInternalApply
+    ClassicArmorMenuReplayGuard = false
+    local ElapsedMs = (os.clock() - Started) * 1000.0
+
+    if Ok then
+        ClassicArmorMenuReplayByWidget[MenuKey] = ColorIndex
+        ClassicArmorMenuPostReplayTokenByWidget[MenuKey] = (tonumber(ClassicArmorMenuPostReplayTokenByWidget[MenuKey]) or 0) + 1
+        local CleanupToken = ClassicArmorMenuPostReplayTokenByWidget[MenuKey]
+        for _, DelayMs in ipairs({ 45, 140, 360 }) do
+            local ThisDelay = DelayMs
+            ExecuteInGameThreadWithDelay(ThisDelay, function()
+                if ModTeardownGuard or ClassicArmorMenuPostReplayTokenByWidget[MenuKey] ~= CleanupToken then return end
+                if tonumber(ClassicArmorMenuSelectedByPlayer[PlayerIndex]) ~= tonumber(ColorIndex) then return end
+                local LiveMenu = ClassicArmorFindLiveMenuByKey(MenuKey)
+                if IsValidObject(LiveMenu) and ClassicArmorMenuIsArmor(LiveMenu) then
+                    ClassicArmorSyncMenuSelection(LiveMenu, PlayerIndex,
+                        string.format("post-replay check cleanup +%dms", ThisDelay))
+                end
+            end)
+        end
+        Log("CLASSIC exact activation replay P%d color=%s source=%s result=ok %.2fms",
+            PlayerIndex, ArmorSkinColorLabel(ColorIndex), tostring(Source or "menu restore"), ElapsedMs)
+        return true, "ok"
+    end
+    Log("CLASSIC exact activation replay P%d color=%s source=%s result=failed error=%s",
+        PlayerIndex, ArmorSkinColorLabel(ColorIndex), tostring(Source or "menu restore"), tostring(Err))
+    return false, tostring(Err)
+end
+
+function ClassicArmorSyncMenuSelection(Menu, PlayerIndex, Source)
+    if ClassicArmorMenuSelectionSyncGuard or ModTeardownGuard then return false end
+    Menu = Unwrap(Menu)
+    if not IsValidObject(Menu) then return false end
+
+    PlayerIndex = tonumber(PlayerIndex) or tonumber(ClassicArmorMenuLastPlayerIndex) or 1
+    local ColorIndex = tonumber(ClassicArmorMenuSelectedByPlayer[PlayerIndex]) or 0
+    if ColorIndex < 1 or ColorIndex > #WarthogCEColors then return false end
+
+    local ListView = nil
+    pcall(function() ListView = Unwrap(Menu.CustomizationListView) end)
+    if not IsValidObject(ListView) then return false end
+
+    local Items = nil
+    local ItemsOk = pcall(function() Items = ListView:GetListItems() end)
+    if not ItemsOk or Items == nil then return false end
+
+    local TargetEntry = nil
+    for _, Value in ipairs(ArrayValues(Items)) do
+        local Entry = Unwrap(Value)
+        local EntryColorIndex = ClassicArmorMenuColorIndex(Entry)
+        if EntryColorIndex == ColorIndex then
+            TargetEntry = Entry
+            break
+        end
+    end
+    if not IsValidObject(TargetEntry) then return false end
+
+    -- The stock Mark V and Classic rows intentionally share the Default gameplay
+    -- tag. Do not ClearSelection: that old clear/select pair exposed a Premium
+    -- preview for a frame. Instead explicitly deselect only the competing Default
+    -- rows, then select the exact Classic UObject. This makes UListView emit the
+    -- normal per-entry selection-change event used by Halo's row Blueprint.
+    local TargetKey = tostring(SafeFullName(TargetEntry) or "")
+    ClassicArmorMenuSelectionSyncGuard = true
+    for _, Value in ipairs(ArrayValues(Items)) do
+        local Entry = Unwrap(Value)
+        local Skin = ""
+        pcall(function() Skin = string.lower(GetTagName(Entry.SkinGameplayTag) or "") end)
+        if Skin == "blam.customization.masterchief.default" then
+            local EntryKey = tostring(SafeFullName(Entry) or "")
+            if EntryKey ~= TargetKey then
+                pcall(function() ListView:BP_SetItemSelection(Entry, false) end)
+            end
+        end
+    end
+    local SelectOk, SelectErr = pcall(function() ListView:BP_SetItemSelection(TargetEntry, true) end)
+    if not SelectOk then
+        SelectOk, SelectErr = pcall(function() ListView:BP_SetSelectedItem(TargetEntry) end)
+    end
+    pcall(function() ListView:RequestScrollItemIntoView(TargetEntry) end)
+    ClassicArmorMenuSelectionSyncGuard = false
+
+    if not SelectOk then
+        Log("CLASSIC menu selection sync failed source=%s select=%s",
+            tostring(Source or "menu refresh"), tostring(SelectErr))
+        return false
+    end
+
+    -- The remembered Classic color is authoritative for the UI. Gameplay must
+    -- remain the real Default Spartan, so the stock equipped-state resolver will
+    -- otherwise keep its checkmark on green forever. Build a live map of the
+    -- materialized row widgets and explicitly move that visual indicator.
+    local DisplayedMap, DisplayedCount, DisplayedMapped, DisplayRoute = ClassicArmorBuildDisplayedWidgetMap(ListView)
+    local VisualRows, VisualUpdated, CheckForced = 0, 0, 0
+    for _, Value in ipairs(ArrayValues(Items)) do
+        local Entry = Unwrap(Value)
+        local Skin = ""
+        pcall(function() Skin = string.lower(GetTagName(Entry.SkinGameplayTag) or "") end)
+        if Skin == "blam.customization.masterchief.default" then
+            local EntryKey = tostring(SafeFullName(Entry) or "")
+            VisualRows = VisualRows + 1
+            local Updated, Forced = ClassicArmorSetEntryVisualSelected(ListView, Entry, EntryKey == TargetKey, DisplayedMap)
+            if Updated then VisualUpdated = VisualUpdated + 1 end
+            CheckForced = CheckForced + (tonumber(Forced) or 0)
+        end
+    end
+    local ReplayStatus = "skipped"
+    local SourceLower = string.lower(tostring(Source or ""))
+    if string.find(SourceLower, "classic activation", 1, true) == nil then
+        local TargetMapKey = ClassicArmorEntryObjectKey(TargetEntry)
+        local TargetWidget = type(DisplayedMap) == "table" and Unwrap(DisplayedMap[TargetMapKey]) or nil
+        if IsValidObject(TargetWidget) then
+            local ReplayOk, ReplayInfo = ClassicArmorReplayExactSelection(Menu, PlayerIndex, TargetEntry, Source)
+            ReplayStatus = ReplayOk and tostring(ReplayInfo or "ok") or ("failed:" .. tostring(ReplayInfo or "unknown"))
+        else
+            ReplayStatus = "waiting-target-widget"
+        end
+    else
+        ReplayStatus = "manual-activation"
+    end
+
+    Log("CLASSIC menu selection sync source=%s P%d color=%s defaultRows=%d visualUpdated=%d checkForced=%d displayed=%d mapped=%d route=%s replay=%s",
+        tostring(Source or "menu refresh"), PlayerIndex, ArmorSkinColorLabel(ColorIndex), VisualRows, VisualUpdated,
+        CheckForced, DisplayedCount, DisplayedMapped, tostring(DisplayRoute or "unknown"), tostring(ReplayStatus))
+    return true
+end
+
+function ClassicArmorInjectMenuRows(Menu)
+    Menu = Unwrap(Menu)
+    if not IsValidObject(Menu) then return false end
+    local MenuKey = tostring(SafeFullName(Menu) or "")
+    if MenuKey == "" or ClassicArmorMenuInjectedByWidget[MenuKey] == "failed" then return false end
+
+    local ListView = nil
+    pcall(function() ListView = Unwrap(Menu.CustomizationListView) end)
+    if not IsValidObject(ListView) then
+        Log("CLASSIC menu rows waiting: CustomizationListView not ready")
+        return false
+    end
+    if not ClassicArmorListViewIsArmor(ListView) then return false end
+    if ClassicMenuHasInjectedRows(ListView) then
+        ClassicArmorMenuInjectedByWidget[MenuKey] = true
+        ClassicArmorSyncMenuSelection(Menu, ClassicArmorMenuLastPlayerIndex, "existing rows")
+        return true
+    end
+    if ClassicArmorMenuInjectedByWidget[MenuKey] == true then
+        ClassicArmorMenuInjectedByWidget[MenuKey] = nil
+        Log("CLASSIC menu rows were reset by the stock widget; reinserting safely")
+    end
+
+    local Entries = {}
+    for _, Path in ipairs(ClassicArmorMenuEntryPaths) do
+        local Entry, ResolvedPath = ClassicLoadMenuEntry(Path)
+        if not IsValidObject(Entry) then
+            Log("CLASSIC menu rows waiting: not mounted/cooked %s", tostring(Path))
+            return false
+        end
+        Log("CLASSIC menu asset resolved: %s", tostring(ResolvedPath))
+        Entries[#Entries + 1] = Entry
+    end
+
+    -- UListView's native ClearListItems path invalidates live entries in this
+    -- game build. Append only: it is stable and never mutates stock UI objects.
+    local Added = 0
+    for _, Entry in ipairs(Entries) do
+        local Ok, Err = pcall(function() ListView:AddItem(Entry) end)
+        if not Ok then
+            ClassicArmorMenuInjectedByWidget[MenuKey] = "failed"
+            Log("CLASSIC menu row add failed after %d rows: %s", Added, tostring(Err))
+            return false
+        end
+        Added = Added + 1
+    end
+    ClassicArmorMenuInjectedByWidget[MenuKey] = true
+    ClassicArmorSyncMenuSelection(Menu, ClassicArmorMenuLastPlayerIndex, "rows added")
+    Log("CLASSIC menu rows added=%d; stock Owned and Premium lists were left unchanged", Added)
+    return true
+end
+
+function ClassicArmorMenuContextIsMenu(Context)
+    local Name = tostring(SafeFullName(Unwrap(Context)) or "")
+    return string.find(Name, "WBP_CustomizationList_C", 1, true) ~= nil
+end
+
+function QueueClassicArmorMenuRefreshSignal(Source)
+    if ClassicArmorMenuResetSignalQueued or ModTeardownGuard then return end
+    ClassicArmorMenuResetSignalQueued = true
+    ExecuteInGameThreadWithDelay(40, function()
+        ClassicArmorMenuResetSignalQueued = false
+        if ModTeardownGuard then return end
+        local Menu = FindCustomizationList()
+        if IsValidObject(Menu) then
+            ScheduleClassicArmorMenuRefresh(Menu, Source or "Customization visibility change")
+        end
+    end)
+end
+
+function ClassicArmorInsertRowsBeforePremium(ListView)
+    ListView = Unwrap(ListView)
+    if ClassicArmorMenuAddItemGuard or not IsValidObject(ListView) then return false end
+    if not ClassicArmorListViewIsArmor(ListView) then return false end
+    local Menu = ClassicArmorMenuForListView(ListView)
+    local MenuKey = tostring(SafeFullName(Menu) or "")
+    if ClassicMenuHasInjectedRows(ListView) then
+        if MenuKey ~= "" then ClassicArmorMenuInjectedByWidget[MenuKey] = true end
+        return true
+    end
+
+    local Entries = {}
+    for _, Path in ipairs(ClassicArmorMenuEntryPaths) do
+        local Entry = ClassicLoadMenuEntry(Path)
+        if not IsValidObject(Entry) then
+            Log("CLASSIC owned insert waiting: not mounted/cooked %s", tostring(Path))
+            return false
+        end
+        Entries[#Entries + 1] = Entry
+    end
+
+    ClassicArmorMenuAddItemGuard = true
+    local Added = 0
+    for _, Entry in ipairs(Entries) do
+        local Ok, Err = pcall(function() ListView:AddItem(Entry) end)
+        if not Ok then
+            ClassicArmorMenuAddItemGuard = false
+            Log("CLASSIC owned insert failed after %d rows: %s", Added, tostring(Err))
+            return false
+        end
+        Added = Added + 1
+    end
+    ClassicArmorMenuAddItemGuard = false
+    if IsValidObject(Menu) then
+        local RestorePlayer = tonumber(ClassicArmorMenuLastPlayerIndex) or 1
+        local RestoreColor = tonumber(ClassicArmorMenuSelectedByPlayer[RestorePlayer]) or 0
+        if MenuKey ~= "" then
+            ClassicArmorMenuInjectedByWidget[MenuKey] = true
+            -- RC3_28: AddItem-after-stock means the list has just been rebuilt.
+            -- A replay cached for the previous realization of this same menu
+            -- widget is no longer sufficient: newly materialized Default rows can
+            -- ask Halo's stock equipped resolver again and resurrect the green
+            -- checkmark. Invalidate only the exact-replay cache for this rebuilt
+            -- list, then allow one fresh exact activation once the remembered
+            -- Classic target row becomes a live widget.
+            ClassicArmorMenuReplayByWidget[MenuKey] = nil
+            ClassicArmorMenuPostReplayTokenByWidget[MenuKey] =
+                (tonumber(ClassicArmorMenuPostReplayTokenByWidget[MenuKey]) or 0) + 1
+        end
+
+        ClassicArmorSyncMenuSelection(Menu, RestorePlayer, "Owned rows inserted")
+
+        -- During frontend-only navigation the target Classic row is often not
+        -- materialized yet on the exact frame where the 18 rows are appended.
+        -- RC3_27 therefore logged replay=waiting-target-widget and then got no
+        -- later lifecycle signal before the user returned to the list. Schedule
+        -- a small bounded settle sequence directly from the rebuild itself. The
+        -- first pass that sees the target widget performs the exact stock
+        -- HandleItemActivated replay; later passes are idempotent via the cache.
+        if RestoreColor >= 1 and RestoreColor <= #WarthogCEColors and MenuKey ~= "" then
+            for _, DelayMs in ipairs({ 90, 240, 520, 950 }) do
+                local ThisDelay = DelayMs
+                ExecuteInGameThreadWithDelay(ThisDelay, function()
+                    if ModTeardownGuard then return end
+                    if tonumber(ClassicArmorMenuSelectedByPlayer[RestorePlayer]) ~= RestoreColor then return end
+                    local LiveMenu = ClassicArmorFindLiveMenuByKey(MenuKey)
+                    if IsValidObject(LiveMenu) and ClassicArmorMenuIsArmor(LiveMenu) then
+                        ClassicArmorSyncMenuSelection(LiveMenu, RestorePlayer,
+                            string.format("post-insert exact restore +%dms", ThisDelay))
+                    end
+                end)
+            end
+        end
+    end
+    Log("CLASSIC menu rows inserted under Owned before Premium=%d", Added)
+    return true
+end
+
+function RegisterClassicArmorMenuRepairHooks()
+    -- SetVisibility fires continuously while the customization screen animates
+    -- and previously queued hundreds of refresh generations. Construction,
+    -- activation, and AddItem-before-Premium provide bounded lifecycle signals.
+    ClassicArmorMenuVisibilityHookReady = false
+
+    if not ClassicArmorMenuAddItemHookReady then
+        local Ok, Err = pcall(function()
+            RegisterHook(
+                "/Script/UMG.ListView:AddItem",
+                function(Context, Entry)
+                    if ClassicArmorMenuAddItemGuard then return end
+                    local ListView = Unwrap(Context)
+                    if not IsValidObject(ClassicArmorMenuForListView(ListView)) then return end
+                    local Name = string.lower(ClassicMenuEntryDisplayName(Entry))
+                    if Name == "available for purchase" then
+                        ClassicArmorInsertRowsBeforePremium(ListView)
+                    end
+                end,
+                function(Context, Entry) end
+            )
+        end)
+        if Ok then
+            ClassicArmorMenuAddItemHookReady = true
+            Log("CLASSIC menu Owned-order hook ready")
+        else
+            Log("CLASSIC menu Owned-order hook unavailable: %s", tostring(Err))
+        end
+    end
+    return ClassicArmorMenuVisibilityHookReady or ClassicArmorMenuAddItemHookReady
+end
+
+function RegisterClassicArmorMenuRefreshHook()
+    if ClassicArmorMenuRefreshHookReady then return true end
+    local Ok, Err = pcall(function()
+        RegisterHook(
+            "/Script/CommonUI.CommonActivatableWidget:BP_OnActivated",
+            function(Context, ...) end,
+            function(Context, ...)
+                local Menu = Unwrap(Context)
+                local FullName = tostring(SafeFullName(Menu) or "")
+                if string.find(FullName, "WBP_CustomizationList_C", 1, true) == nil then return end
+                ScheduleClassicArmorMenuRefresh(Menu, "CommonActivatableWidget activation")
+            end
+        )
+    end)
+    if Ok then
+        ClassicArmorMenuRefreshHookReady = true
+        Log("CLASSIC menu refresh hook ready")
+        return true
+    end
+    Log("CLASSIC menu refresh hook unavailable: %s", tostring(Err))
+    return false
+end
+
+function ScheduleClassicArmorMenuRefresh(Menu, Source)
+    Menu = Unwrap(Menu)
+    if not IsValidObject(Menu) then return end
+    local MenuKey = tostring(SafeFullName(Menu) or "")
+    if MenuKey == "" or ClassicArmorMenuRefreshPendingByWidget[MenuKey] then return end
+    ClassicArmorMenuRefreshPendingByWidget[MenuKey] = true
+    -- Match the proven Controller Settings repair pattern. The stock list can
+    -- rebuild more than once after activation, so each real UI signal owns a
+    -- bounded callback generation rather than a permanent scan.
+    ClassicArmorMenuRefreshGeneration = ClassicArmorMenuRefreshGeneration + 1
+    local Generation = ClassicArmorMenuRefreshGeneration
+    Log("CLASSIC menu refresh scheduled by %s generation=%d", tostring(Source or "UI event"), Generation)
+    for _, DelayMs in ipairs({ 80, 300, 900, 1600 }) do
+        ExecuteInGameThreadWithDelay(DelayMs, function()
+            if ModTeardownGuard then return end
+            local LiveMenu = ClassicArmorFindLiveMenuByKey(MenuKey)
+            if IsValidObject(LiveMenu) then ClassicArmorInjectMenuRows(LiveMenu) end
+        end)
+    end
+    ExecuteInGameThreadWithDelay(1700, function()
+        ClassicArmorMenuRefreshPendingByWidget[MenuKey] = nil
+    end)
+end
+
+function TryRegisterClassicArmorMenuBlueprintRefreshHook(Quiet)
+    if ClassicArmorMenuBlueprintRefreshHookReady then return true end
+    local Ok, Err = pcall(function()
+        RegisterHook(
+            "/Game/UI/Frontend/Customization/Widgets/WBP_CustomizationList.WBP_CustomizationList_C:BP_OnActivated",
+            function(Context, ...) end,
+            function(Context, ...)
+                ScheduleClassicArmorMenuRefresh(Unwrap(Context), "WBP_CustomizationList_C.BP_OnActivated")
+            end
+        )
+    end)
+    if Ok then
+        ClassicArmorMenuBlueprintRefreshHookReady = true
+        Log("CLASSIC menu exact BP_OnActivated hook ready")
+        return true
+    end
+    if not Quiet then Log("CLASSIC menu exact BP_OnActivated hook unavailable: %s", tostring(Err)) end
+    return false
+end
+
+function ClassicArmorMenuForListView(ListView)
+    ListView = Unwrap(ListView)
+    if not IsValidObject(ListView) then return nil end
+    local ListKey = tostring(SafeFullName(ListView) or "")
+    if ListKey == "" then return nil end
+    local Menus = FindAllOf("WBP_CustomizationList_C") or {}
+    for _, RawMenu in ipairs(ArrayValues(Menus)) do
+        local Menu = Unwrap(RawMenu)
+        if IsValidObject(Menu) then
+            local Candidate = nil
+            pcall(function() Candidate = Unwrap(Menu.CustomizationListView) end)
+            if IsValidObject(Candidate) and tostring(SafeFullName(Candidate) or "") == ListKey then
+                return Menu
+            end
+        end
+    end
+    return nil
+end
+
+function QueueClassicArmorMenuResetRefresh(ListView, Source)
+    if ClassicArmorMenuResetSignalQueued or ModTeardownGuard then return end
+    local Menu = ClassicArmorMenuForListView(ListView)
+    if not IsValidObject(Menu) then return end
+    ClassicArmorMenuResetSignalQueued = true
+    ExecuteInGameThreadWithDelay(40, function()
+        ClassicArmorMenuResetSignalQueued = false
+        if ModTeardownGuard then return end
+        ScheduleClassicArmorMenuRefresh(Menu, Source)
+    end)
+end
+
+function RegisterClassicArmorMenuListResetHooks()
+    if ClassicArmorMenuListResetHookReady then return true end
+    local Registered = false
+    for _, FunctionPath in ipairs({
+        "/Script/UMG.ListViewBase:ClearListItems",
+        "/Script/UMG.ListView:SetListItems",
+    }) do
+        local HookPath = FunctionPath
+        local Ok, Err = pcall(function()
+            RegisterHook(
+                HookPath,
+                function(Context, ...) end,
+                function(Context, ...)
+                    QueueClassicArmorMenuResetRefresh(Unwrap(Context), HookPath)
+                end
+            )
+        end)
+        if Ok then
+            Registered = true
+            Log("CLASSIC menu list-reset hook ready: %s", HookPath)
+        else
+            Log("CLASSIC menu list-reset hook unavailable: %s (%s)", HookPath, tostring(Err))
+        end
+    end
+    ClassicArmorMenuListResetHookReady = Registered
+    return Registered
+end
+
+function RegisterClassicArmorMenuListListener()
+    if ClassicArmorMenuListListenerReady then return true end
+    local Ok, Err = pcall(function()
+        NotifyOnNewObject(
+            "/Game/UI/Frontend/Customization/Widgets/WBP_CustomizationList.WBP_CustomizationList_C",
+            function(Menu)
+                -- The Blueprint function becomes hookable only after its first
+                -- live instance on some Modkit/game builds.
+                RegisterClassicArmorMenuActivationHook()
+                TryRegisterClassicArmorMenuBlueprintRefreshHook(true)
+                ScheduleClassicArmorMenuRefresh(Menu, "WBP_CustomizationList_C construction")
+            end
+        )
+    end)
+    if Ok then
+        ClassicArmorMenuListListenerReady = true
+        RegisterClassicArmorMenuRefreshHook()
+        RegisterClassicArmorMenuListResetHooks()
+        RegisterClassicArmorMenuRepairHooks()
+        Log("CLASSIC menu list listener ready")
+        return true
+    end
+    Log("CLASSIC menu list listener unavailable: %s", tostring(Err))
+    return false
+end
+
+function CycleContextColor(PlayerIndex, Delta, Source)
+    local InVehicle, VehicleInfo = ArmorSkinPlayerInAnyVehicle(PlayerIndex)
+    if InVehicle then
+        Log("COLOR INPUT P%d context=vehicle route=%s source=%s", PlayerIndex, tostring(VehicleInfo), tostring(Source))
+        return CycleOccupiedVehicleColor(PlayerIndex, Delta, Source)
+    end
+    Log("COLOR INPUT P%d context=on-foot armor-skin source=%s", PlayerIndex, tostring(Source))
+    return CycleDefaultSpartanSkin(PlayerIndex, Delta, Source)
+end
+
+function ArmorSkinMaintenanceTick(PlayerIndex)
+    if not MissionReady then return end
+
+    -- RC3_56: ReceiveTick still calls this every frame, but the armor watchdog
+    -- must not do UObject/component work every few dozen frames. Presentation
+    -- changes are event-driven via NotifyOnNewObject; this is only a slow safety
+    -- net for missed lifecycle events and late FP-arms publication.
+    local Now=os.clock()
+    if (tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0) > Now then return end
+    ArmorSkinMaintenanceNextClock=ArmorSkinMaintenanceNextClock or { [1]=0, [2]=0 }
+    ArmorSkinPairVectorNextReadyCheckClock=tonumber(ArmorSkinPairVectorNextReadyCheckClock) or 0
+
+    local ColorIndex = tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) or 0
+    if ColorIndex <= 0 then return end
+    -- V12: network Classic is event/input driven only. V11 still fell through to
+    -- ArmorSkinFirstPersonAnchor/Pawn component scans every 2.5s after respawn,
+    -- defeating the TP-only isolation and keeping risky UObject refs alive.
+    if VehicleMessageOfflineFastPath ~= true then
+        return
+    end
+    if Now < (tonumber(ArmorSkinMaintenanceNextClock[PlayerIndex]) or 0) then return end
+    ArmorSkinMaintenanceNextClock[PlayerIndex]=Now+2.5
+
+    local Controller = GetPlayer(PlayerIndex)
+    local Pawn = ArmorSkinGetPawnFromController(Controller)
+    if not IsValidObject(Pawn) then return end
+    local PlayerId = ArmorSkinPlayerIdFromController(Controller)
+    local TargetKey = ArmorSkinTargetKey(PlayerId, PlayerIndex)
+    local State = ArmorSkinAppliedByTarget[TargetKey]
+    local Biped = ArmorSkinFindThirdPersonBiped(Pawn)
+    if not IsValidObject(Biped) then return end
+
+    local BipedKey = ArmorSkinObjectKey(Biped)
+    local StateBipedKey = nil
+    if type(State) == "table" then
+        StateBipedKey = State.BipedKey or ArmorSkinObjectKey(State.Biped)
+    end
+    if type(State) ~= "table" or BipedKey == nil or StateBipedKey ~= BipedKey then
+        ArmorSkinScheduleLocalApply(PlayerIndex, ColorIndex, "lightweight biped watchdog", true)
+        return
+    end
+
+    local Arms, ArmsKey, ArmsRoute = ArmorSkinFirstPersonAnchor(Pawn)
+    local FirstPersonCount = ArmorSkinStateFirstPersonCount(State)
+    local ArmsChanged = IsValidObject(Arms) and ArmsKey ~= nil and State.FirstPersonArmsKey ~= nil
+        and tostring(ArmsKey) ~= tostring(State.FirstPersonArmsKey)
+    local ArmsMissingFromState = IsValidObject(Arms) and FirstPersonCount <= 0
+    if ArmsChanged or ArmsMissingFromState then
+        local Retry = ArmorSkinFirstPersonRetryByTarget[TargetKey] or { Attempts = 0, NextClock = 0 }
+        if Now >= (tonumber(Retry.NextClock) or 0) then
+            Retry.Attempts = (tonumber(Retry.Attempts) or 0) + 1
+            local BackoffSeconds = { 2, 4, 8, 16 }
+            local DelaySeconds = BackoffSeconds[math.min(Retry.Attempts, #BackoffSeconds)] or 16
+            Retry.NextClock = Now + DelaySeconds
+            ArmorSkinFirstPersonRetryByTarget[TargetKey] = Retry
+            Log("ARMORSKIN first-person repair P%d attempt=%d reason=%s nextRetry=%.1fs arms=%s",
+                PlayerIndex, Retry.Attempts, ArmsChanged and "arms-instance-changed" or "missing-first-person-MID",
+                DelaySeconds, tostring((ArmsKey or "unavailable") .. " route=" .. tostring(ArmsRoute or "unavailable")))
+            ArmorSkinScheduleLocalApply(PlayerIndex, ColorIndex, "first-person arms lightweight repair", false)
+        end
+    else
+        ArmorSkinFirstPersonRetryByTarget[TargetKey] = nil
+        -- Binding drift is intentionally sampled only by this 2.5s watchdog, not
+        -- every 25 frames. Check FP items only; TP lifecycle has its own event.
+        local Detached = 0
+        for _, Item in ipairs(State.Items or {}) do
+            local ScopeLower = string.lower(tostring(Item.Scope or ""))
+            if string.find(ScopeLower, "first-person", 1, true) == 1
+                and IsValidObject(Item.Component) and IsValidObject(Item.MID) then
+                local CurrentMaterial = nil
+                pcall(function() CurrentMaterial = Unwrap(Item.Component:GetMaterial(Item.Slot)) end)
+                local CurrentKey = ArmorSkinObjectKey(CurrentMaterial)
+                local MidKey = ArmorSkinObjectKey(Item.MID)
+                if CurrentKey == nil or MidKey == nil or tostring(CurrentKey) ~= tostring(MidKey) then
+                    Detached = Detached + 1
+                end
+            end
+        end
+        if Detached > 0 and PerspectiveThirdPerson[PlayerIndex] ~= true then
+            Log("ARMORSKIN first-person binding drift P%d detached=%d; scheduling MID rebind", PlayerIndex, Detached)
+            ArmorSkinSchedulePerspectiveFirstPersonRebind(PlayerIndex, "lightweight watchdog binding drift")
+        end
+    end
+end
+
+function ArmorSkinScheduleTrackedReapply(Reason)
+    local RuntimeGeneration = WarthogColorRuntimeGeneration
+    ExecuteInGameThreadWithDelay(350, function()
+        if ModTeardownGuard or RuntimeGeneration ~= WarthogColorRuntimeGeneration or not MissionReady then return end
+        if ArmorSkinPersistentRestoreRemoteStates ~= nil then
+            ArmorSkinPersistentRestoreRemoteStates(Reason or "tracked reapply")
+        end
+        if ArmorSkinScheduleMissionCarryRemoteReapply ~= nil then
+            ArmorSkinScheduleMissionCarryRemoteReapply(Reason or "tracked reapply")
+        end
+        for PlayerIndex = 1, 2 do
+            local ColorIndex = tonumber(ArmorSkinLocalIndexByPlayer[PlayerIndex]) or 0
+            if ColorIndex > 0 and IsValidObject(GetPlayer(PlayerIndex)) then
+                ArmorSkinScheduleLocalApply(PlayerIndex, ColorIndex, Reason or "mission ready", true)
+            end
+        end
+        for Key, ColorIndex in pairs(ArmorSkinNetworkColorByPlayerId or {}) do
+            local PlayerId = tonumber(Key)
+            if PlayerId ~= nil and tonumber(ColorIndex) ~= nil and tonumber(ColorIndex) > 0 then
+                ArmorSkinScheduleNetworkApply(PlayerId, tonumber(ColorIndex), Reason or "mission ready")
+            end
+        end
+    end)
+end
+
+function ArmorSkinScheduleRespawnRemoteIdentityRetry(Source)
+    ArmorSkinRespawnIdentityRetryToken=(tonumber(ArmorSkinRespawnIdentityRetryToken) or 0)+1
+    local Token=ArmorSkinRespawnIdentityRetryToken
+    local Generation=tonumber(WarthogColorRuntimeGeneration) or 0
+    ArmorSkinRespawnIdentitySettledGeneration=-1
+    -- Identity-only retries are intentionally sparse. They touch no material until
+    -- the pair-vector becomes decisive, so waiting for remote presentation actors
+    -- to settle costs only two position reads plus the bounded resolver.
+    local Delays={2500,6000,11000,17000,24000}
+    for _,Delay in ipairs(Delays) do
+        local D=Delay
+        ExecuteInGameThreadWithDelay(D,function()
+            if Token~=ArmorSkinRespawnIdentityRetryToken or ModTeardownGuard or not MissionReady
+                or Generation~=(tonumber(WarthogColorRuntimeGeneration) or 0) then return end
+            if tonumber(ArmorSkinRespawnIdentitySettledGeneration)==Generation then return end
+            local V=ArmorSkinRemotePairVector
+            if type(V)~="table" or tonumber(V.Generation)~=Generation then return end
+            local Records=ArmorSkinAllKnownPlayerPawnRecords()
+            local Remote={}
+            for _,R in ipairs(type(Records)=="table" and Records or {}) do
+                if R.LocalIndex==nil and tonumber(R.PlayerId)~=nil then
+                    local K=tostring(math.floor(tonumber(R.PlayerId)))
+                    local C=tonumber(ArmorSkinPersistentRemoteColorByPlayerId[K])
+                    if C~=nil and C>0 and C<=#WarthogCEColors then Remote[#Remote+1]={R=R,C=C} end
+                end
+            end
+            if #Remote~=2 then return end
+            local Probe=Unwrap(Remote[1].R.Pawn)
+            if IsValidObject(Probe) then ArmorSkinBuildBipedAssignments(Probe) end
+            local Ready=true
+            for _,E in ipairs(Remote) do
+                local B=ArmorSkinFindAssignedBiped(E.R.Pawn)
+                if not IsValidObject(B) then Ready=false; break end
+            end
+            if not Ready then
+                if D==Delays[#Delays] then
+                    Log("ARMORSKIN respawn identity retry exhausted generation=%d source=%s",Generation,tostring(Source or "respawn"))
+                end
+                return
+            end
+            local Applied=0
+            for _,E in ipairs(Remote) do
+                local Pid=tonumber(E.R.PlayerId)
+                local Pawn=Unwrap(E.R.Pawn)
+                if not IsValidObject(Pawn) then Pawn=select(1,ArmorSkinResolvePawnByPlayerId(Pid)) end
+                if IsValidObject(Pawn) then
+                    local Ok=ArmorSkinApplyToPawn(Pawn,Pid,nil,E.C,string.format("respawn identity settled +%dms",D))
+                    if Ok then Applied=Applied+1 end
+                end
+            end
+            if Applied>=#Remote then
+                ArmorSkinRespawnIdentitySettledGeneration=Generation
+                Log("ARMORSKIN respawn remote identity SETTLED generation=%d applied=%d delay=%dms source=%s",
+                    Generation,Applied,D,tostring(Source or "respawn"))
+            end
+        end)
+    end
+end
+
+function ArmorSkinScheduleRespawnSettledRebind(Source)
+    ArmorSkinRespawnSettleToken=(tonumber(ArmorSkinRespawnSettleToken) or 0)+1
+    local Token=ArmorSkinRespawnSettleToken
+    local Generation=WarthogColorRuntimeGeneration
+    -- Debounce the entire construction burst. Multiple BP_SpartansBipedActor
+    -- objects are created for the same respawn/transition; only the last event may
+    -- arm a rebind. No material/MID pointers are captured in this delayed closure.
+    ExecuteInGameThreadWithDelay(2200,function()
+        if Token~=ArmorSkinRespawnSettleToken or ModTeardownGuard or not MissionReady
+            or Generation~=WarthogColorRuntimeGeneration then return end
+        if (tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0) > os.clock() then return end
+        Log("ARMORSKIN respawn settle gate OPEN generation=%s source=%s",
+            tostring(Generation),tostring(Source or "biped construction"))
+        -- Reuse the established tokenized apply/retry paths only after the world
+        -- is quiet. They reacquire Controller/Pawn/components at execution time.
+        ArmorSkinScheduleTrackedReapply("respawn settled")
+        if ArmorSkinScheduleRespawnRemoteIdentityRetry ~= nil then
+            ArmorSkinScheduleRespawnRemoteIdentityRetry("respawn settled")
+        end
+        if ArmorSkinScheduleRespawnPairVectorRepublish ~= nil then
+            ArmorSkinScheduleRespawnPairVectorRepublish("respawn settled")
+        end
+    end)
+end
+
+-- V15: the stock customization layer can rewrite the freshly spawned Default
+-- Chief after the first 2.2s rebind. Reassert committed local Classic state later,
+-- but only through the exact-local-anchor V15 path.
+local ArmorSkinScheduleRespawnSettledRebindV15Base = ArmorSkinScheduleRespawnSettledRebind
+function ArmorSkinScheduleRespawnSettledRebind(Source)
+    ArmorSkinScheduleRespawnSettledRebindV15Base(Source)
+    local Generation=WarthogColorRuntimeGeneration
+    local Token=tonumber(ArmorSkinRespawnSettleToken) or 0
+    for _,Delay in ipairs({5000,8000}) do
+        ExecuteInGameThreadWithDelay(Delay,function()
+            if ModTeardownGuard or not MissionReady or Generation~=WarthogColorRuntimeGeneration
+                or Token~=(tonumber(ArmorSkinRespawnSettleToken) or 0) then return end
+            for PlayerIndex=1,2 do
+                local ColorIndex=tonumber(ClassicArmorMenuSelectedByPlayer[PlayerIndex]) or 0
+                if ColorIndex>0 and IsValidObject(GetPlayer(PlayerIndex)) then
+                    ArmorSkinLocalIndexByPlayer[PlayerIndex]=ColorIndex
+                    ArmorSkinScheduleLocalApply(PlayerIndex,ColorIndex,
+                        string.format("V15 post-respawn committed reassert +%dms",Delay),false)
+                end
+            end
+        end)
+    end
+end
+
+function ArmorSkinScheduleRespawnPairVectorRepublish(Source)
+    -- Retired with the custom HCECEA armor network transport.
+    return false
+end
+
+function RegisterArmorSkinBipedConstructionListener()
+    if ArmorSkinBipedConstructionListenerReady then return true end
+    local Ok, Err = pcall(function()
+        NotifyOnNewObject(
+            "/Game/_Prototypes/SynchronizationTestContent/TestActor/BP_SpartansBipedActor.BP_SpartansBipedActor_C",
+            function(Biped)
+                ClassicArmorV16BipedEpoch = (tonumber(ClassicArmorV16BipedEpoch) or 0) + 1
+                -- V17: keep string-only local biped proofs across construction events.
+                -- The epoch marks them stale so the resolver revalidates them against
+                -- current spatial/fresh candidates before reuse; no UObject is retained.
+                ArmorSkinCacheBipedInstance(Biped, "NotifyOnNewObject")
+                local FreshKey=ArmorSkinObjectKey(Biped)
+                local FreshClock=os.clock()
+                ArmorSkinLastBipedConstructionClock=FreshClock
+                if FreshKey~=nil then
+                    ArmorSkinFreshBipedByKey[FreshKey]={Biped=Unwrap(Biped),Clock=FreshClock,
+                        Generation=tonumber(WarthogColorRuntimeGeneration) or 0}
+                end
+                ArmorSkinClearBipedAssignments("new Spartan biped constructed")
+                -- RC3_55 native crash fix: never retain Component/MID references
+                -- across biped replacement. RC3_54 could update an old P1 MID and
+                -- then dereference a just-freed P2 component, producing a native
+                -- EXCEPTION_ACCESS_VIOLATION that Lua pcall cannot catch. Dropping
+                -- the Lua references is safe; do NOT restore old materials here.
+                ArmorSkinDropAllRuntimeRefs("new Spartan biped constructed; stale MID refs discarded")
+                ArmorSkinRemotePairVector=nil
+                ArmorSkinPairVectorAuditLogged={}
+                ArmorSkinPairVectorSourceReadyGeneration=-1
+                ArmorSkinPairVectorLastClientUplinkSignature=""
+                ArmorSkinPairVectorLastSignatureByController={}
+                -- Extend the no-touch window on every construction event so a burst
+                -- of P1/P2/remote presentation actors produces one settled rebind.
+                ArmorSkinBipedWriteQuietUntilClock=math.max(tonumber(ArmorSkinBipedWriteQuietUntilClock) or 0,os.clock()+2.0)
+                if ArmorSkinScheduleRespawnSettledRebind ~= nil then
+                    ArmorSkinScheduleRespawnSettledRebind("new Spartan biped constructed")
+                end
+            end
+        )
+    end)
+    if Ok then
+        ArmorSkinBipedConstructionListenerReady = true
+        Log("ARMORSKIN Spartan biped construction listener ready; respawn reapply is event-driven")
+        return true
+    end
+    Log("ARMORSKIN Spartan biped construction listener unavailable: %s", tostring(Err))
+    return false
+end
+
+function ArmorSkinResetSessionState(Reason)
+    if ArmorSkinPaletteReset ~= nil then ArmorSkinPaletteReset("session/world reset: " .. tostring(Reason or "session boundary")) end
+    ArmorSkinAppliedByTarget = {}
+    ArmorSkinLocalIndexByPlayer = {
+        [1] = tonumber(ClassicArmorMenuSelectedByPlayer[1]) or 0,
+        [2] = tonumber(ClassicArmorMenuSelectedByPlayer[2]) or 0,
+    }
+    ArmorSkinLocalApplyToken = { [1] = 0, [2] = 0 }
+    ArmorSkinLocalSettledToken = { [1] = 0, [2] = 0 }
+    ArmorSkinMaintainCounter = { [1] = 0, [2] = 0 }
+    ArmorSkinMaintenanceNextClock = { [1] = 0, [2] = 0 }
+    ArmorSkinPairVectorNextReadyCheckClock = 0
+    ArmorSkinFirstPersonRetryByTarget = {}
+    ArmorSkinPerspectiveRebindToken = { [1] = 0, [2] = 0 }
+    ArmorSkinRemoteBipedRouteLogged = {}
+    ArmorSkinRemoteBipedFailureLogged = {}
+    ArmorSkinRemoteAttachedAuditLogged = {}
+    ArmorSkinBipedInstanceCache = {}
+    ArmorSkinBipedInstanceSeen = {}
+    ArmorSkinFreshBipedByKey = {}
+    ArmorSkinLastBipedConstructionClock = 0
+    if ArmorSkinCancelSlicedJobs ~= nil then ArmorSkinCancelSlicedJobs("session state reset") end
+    ArmorSkinBipedExactScanGeneration = -1
+    ArmorSkinBipedAssignmentByPawnKey = {}
+    ArmorSkinBipedAssignmentMetaByPawnKey = {}
+    ArmorSkinLastKnownBipedKeyByPlayerId = {}
+    ClassicArmorPendingCommitByPlayer = {}
+    ArmorSkinBipedAssignmentAuditLogged = {}
+    ArmorSkinBipedAnchorPendingLogged = {}
+    ArmorSkinBipedMotionBaseline = {}
+    ArmorSkinBipedOrdinalAuditLogged = {}
+    ArmorSkinPlayerIdOrdinalHint = nil
+    ArmorSkinOrdinalHintSentByController = {}
+    ArmorSkinOrdinalAuditLogged = {}
+    ArmorSkinCVWSkeletalCache = {}
+    ArmorSkinCVWSkeletalSeen = {}
+    ArmorSkinCVWExactScanGeneration = -1
+    ArmorSkinChiefPresentationClasses = {}
+    ArmorSkinChiefPresentationClassSeen = {}
+    ArmorSkinSyncReflectionAuditLogged = {}
+    ArmorSkinTexturePrewarmRequestedGeneration = -1
+    ClassicArmorMenuReplayByWidget = {}
+    ClassicArmorMenuPostReplayTokenByWidget = {}
+    -- Runtime network state is world-local. RC3_43 deliberately keeps
+    -- ArmorSkinPersistentRemote* intact so unchanged fireteam members retain
+    -- their logical color across mission travel; live protocol-2 state overrides it.
+    ArmorSkinNetworkColorByPlayerId = {}
+    ArmorSkinNetworkPendingTokenByPlayerId = {}
+    ArmorSkinNetworkSequence = 0
+    ArmorSkinNetworkUplinkSequence = 0
+    ArmorSkinNetworkLastReceivedSequenceByPlayerId = {}
+    ArmorSkinNetworkLastUplinkSequenceByController = {}
+    ArmorSkinNetworkResolveRouteByPlayerId = {}
+    ArmorSkinNetworkLastPublishedLocalColorByPlayerId = {}
+    -- P2 callsign transport is independent from the retired armor protocol, but
+    -- its bounded publish/de-duplication state must still reset at world boundaries.
+    IdentityNameLastPublishedByPlayerId = {}
+    IdentityNameLastUplinkSequenceByController = {}
+    IdentityFrontendNameLastSignature = ""
+    IdentityFrontendNamePublishToken = (tonumber(IdentityFrontendNamePublishToken) or 0) + 1
+    Log("ARMORSKIN session state reset: %s", tostring(Reason or "session boundary"))
+end
 
 -- In-game weapon skin switching --------------------------------------------
 -- Release path: exact runtime actor names only. The seven families below were
@@ -7437,6 +13255,9 @@ WeaponSkinDefinitionOrder = WeaponSkinDefinitionOrder or {
 }
 WeaponSkinCatalogs = WeaponSkinCatalogs or {}
 WeaponSkinNativeStatics = WeaponSkinNativeStatics or nil
+CustomizationOwnedPackageCache = CustomizationOwnedPackageCache or { [1] = {}, [2] = {} }
+CustomizationEntitlementRequests = CustomizationEntitlementRequests or {}
+CustomizationOwnershipLog = CustomizationOwnershipLog or {}
 WeaponSkinFastVisualCache = WeaponSkinFastVisualCache or {
     [1] = { Pawn = nil, Anchors = nil },
     [2] = { Pawn = nil, Anchors = nil },
@@ -7535,6 +13356,119 @@ function GetWeaponSkinNativeStatics()
     return nil
 end
 
+function CustomizationBool(Value)
+    local Unwrapped = Unwrap(Value)
+    if Unwrapped == true then return true end
+    if type(Unwrapped) == "number" then return Unwrapped ~= 0 end
+    local Text = string.lower(SafeToString(Unwrapped) or "")
+    return Text == "true" or Text == "1"
+end
+
+function CustomizationRequestEntitlements(Controller, Statics)
+    if not IsValidObject(Controller) or not IsValidObject(Statics) then return end
+    local ControllerKey = SafeFullName(Controller) or tostring(Controller)
+    if CustomizationEntitlementRequests[ControllerKey] then return end
+    CustomizationEntitlementRequests[ControllerKey] = true
+    local Ok, Err = pcall(function() Statics:RequestWaypointEntitlements(Controller) end)
+    Log("CUSTOMIZATION entitlement refresh controller=%s result=%s%s",
+        tostring(ControllerKey), tostring(Ok), Ok and "" or (" error=" .. tostring(Err)))
+end
+
+function CustomizationPackageCandidates(PackageName)
+    local Package = tostring(PackageName or "")
+    local Result = {}
+    local Seen = {}
+    local function Add(Value)
+        Value = tostring(Value or "")
+        if Value ~= "" and not Seen[string.lower(Value)] then
+            Seen[string.lower(Value)] = true
+            Result[#Result + 1] = Value
+        end
+    end
+    Add(Package)
+    Add(string.match(Package, "CustomizationPackage%.(.+)$"))
+    return Result
+end
+
+CustomizationAlwaysFreeSkins = CustomizationAlwaysFreeSkins or {
+    ["blam.customization.masterchief.originalce"] = true,
+    ["blam.customization.masterchief.blackandgold"] = true,
+    ["blam.customization.masterchief.purple_001"] = true,
+    ["blam.customization.masterchief.blue_001"] = true,
+    ["blam.customization.assaultrifle.originalce"] = true,
+    ["blam.customization.assaultrifle.blackandgold"] = true,
+    ["blam.customization.assaultrifle.ship_001"] = true,
+}
+
+-- Empty package tags are the game's Owned rows. A small explicit allowlist
+-- corrects stock metadata that marks known free/non-premium rows as gated.
+-- All other non-empty packages still require Halo's native entitlement result.
+function IsCustomizationEntryAvailable(PlayerIndex, Entry)
+    if Entry == nil then return false, "missing entry" end
+    local SkinKey = string.lower(tostring(Entry.Skin or ""))
+    if CustomizationAlwaysFreeSkins[SkinKey] then return true, "project free row" end
+    local Package = tostring(Entry.Package or "")
+    if Package == "" or Package == "None" then return true, "owned row" end
+
+    PlayerIndex = math.max(1, math.min(2, tonumber(PlayerIndex) or 1))
+    local Cache = CustomizationOwnedPackageCache[PlayerIndex]
+    if Cache == nil then
+        Cache = {}
+        CustomizationOwnedPackageCache[PlayerIndex] = Cache
+    end
+    local PackageKey = string.lower(Package)
+    if Cache[PackageKey] == true then return true, "cached entitlement" end
+
+    local Controller = GetPlayer(PlayerIndex)
+    local Statics = GetWeaponSkinNativeStatics()
+    if not IsValidObject(Controller) or not IsValidObject(Statics) then
+        return false, "ownership API unavailable"
+    end
+    CustomizationRequestEntitlements(Controller, Statics)
+
+    local Checked = {}
+    for _, Candidate in ipairs(CustomizationPackageCandidates(Package)) do
+        local Ok, Owned = pcall(function()
+            return Statics:IsDLCPurchased(Controller, FName(Candidate))
+        end)
+        Checked[#Checked + 1] = string.format("%s=%s", Candidate, Ok and SafeToString(Owned) or "error")
+        if Ok and CustomizationBool(Owned) then
+            Cache[PackageKey] = true
+            local LogKey = string.format("%d:%s:true", PlayerIndex, PackageKey)
+            if not CustomizationOwnershipLog[LogKey] then
+                CustomizationOwnershipLog[LogKey] = true
+                Log("CUSTOMIZATION package allowed P%d package=%s via=%s",
+                    PlayerIndex, Package, Candidate)
+            end
+            return true, "entitlement confirmed"
+        end
+    end
+
+    local DeniedLogKey = string.format("%d:%s:false", PlayerIndex, PackageKey)
+    if not CustomizationOwnershipLog[DeniedLogKey] then
+        CustomizationOwnershipLog[DeniedLogKey] = true
+        Log("CUSTOMIZATION package denied P%d package=%s checks=%s",
+            PlayerIndex, Package, table.concat(Checked, ", "))
+    end
+    return false, "premium package not owned"
+end
+
+function FindNextAvailableCustomizationIndex(PlayerIndex, Catalog, CurrentIndex, Delta)
+    if Catalog == nil or #Catalog == 0 then return nil, 0 end
+    local Direction = (tonumber(Delta) or 1) < 0 and -1 or 1
+    local Index = tonumber(CurrentIndex) or 1
+    local Skipped = 0
+    for _ = 1, #Catalog do
+        Index = Index + Direction
+        if Index > #Catalog then Index = 1 end
+        if Index < 1 then Index = #Catalog end
+        local Allowed = IsCustomizationEntryAvailable(PlayerIndex, Catalog[Index])
+        if Allowed then return Index, Skipped end
+        Skipped = Skipped + 1
+    end
+    return nil, Skipped
+end
+
 function ApplyWeaponSkinNative(PlayerIndex, Controller, Entry)
     if not IsValidObject(Controller) or Entry == nil then return false, "controller/entry unavailable" end
     local Statics = GetWeaponSkinNativeStatics()
@@ -7580,6 +13514,8 @@ end
 function ApplyWeaponSkinDirect(PlayerIndex, TypeName, Entry)
     local Def = WeaponSkinDefinitions[TypeName]
     if Def == nil or Entry == nil then return false, "missing weapon definition/catalog entry" end
+    local Available, AvailabilityInfo = IsCustomizationEntryAvailable(PlayerIndex, Entry)
+    if not Available then return false, AvailabilityInfo end
     local Settings, SettingsInfo = GetUserSettings(PlayerIndex)
     if not IsValidObject(Settings) then return false, SettingsInfo end
 
@@ -7898,8 +13834,14 @@ function CycleHeldWeaponSkin(PlayerIndex, Source)
         return false
     end
     local CurrentIndex = WeaponSkinCurrentIndex(Settings, Def, Catalog)
-    local NextIndex = CurrentIndex + 1
-    if NextIndex > #Catalog then NextIndex = 1 end
+    local NextIndex, Skipped = FindNextAvailableCustomizationIndex(PlayerIndex, Catalog, CurrentIndex, 1)
+    if NextIndex == nil or NextIndex == CurrentIndex then
+        ScreenMessage(PlayerIndex, Controller,
+            string.format("%s: NO OTHER OWNED SKIN FOUND", tostring(Def and Def.Label or TypeName)))
+        Log("Weapon skin P%d no eligible alternate type=%s skipped=%d",
+            PlayerIndex, tostring(TypeName), tonumber(Skipped) or 0)
+        return false
+    end
     local Entry = Catalog[NextIndex]
     local Ok, Info = ApplyWeaponSkinDirect(PlayerIndex, TypeName, Entry)
     if not Ok then
@@ -7907,8 +13849,9 @@ function CycleHeldWeaponSkin(PlayerIndex, Source)
         Log("Weapon skin P%d apply failed: %s", PlayerIndex, tostring(Info))
         return false
     end
-    Log("Weapon skin P%d cycle source=%s type=%s index=%d/%d skin=%s",
-        PlayerIndex, tostring(Source), tostring(TypeName), NextIndex, #Catalog, tostring(Entry.Skin))
+    Log("Weapon skin P%d cycle source=%s type=%s index=%d/%d skin=%s lockedSkipped=%d",
+        PlayerIndex, tostring(Source), tostring(TypeName), NextIndex, #Catalog, tostring(Entry.Skin),
+        tonumber(Skipped) or 0)
     ScreenMessage(PlayerIndex, Controller,
         string.format("P%d %s SKIN %02d/%02d - %s", PlayerIndex, Def.Label, NextIndex, #Catalog, Entry.Name))
     return true
@@ -7970,6 +13913,13 @@ local function ApplyArmorSelection(PlayerIndex, Index)
     local Player = GetPlayer(PlayerIndex)
     if not IsValidObject(Player) then return false end
     local Entry = ArmorCatalog[Index]
+    local Available, AvailabilityInfo = IsCustomizationEntryAvailable(PlayerIndex, Entry)
+    if not Available then
+        Log("ARMOR P%d blocked package=%s skin=%s reason=%s",
+            PlayerIndex, tostring(Entry.Package), tostring(Entry.Skin), tostring(AvailabilityInfo))
+        ScreenMessage(PlayerIndex, Player, "ARMOR: PREMIUM CONTENT NOT OWNED")
+        return false
+    end
 
     -- Primary armor route: use the per-local-user settings API. This works without
     -- ever constructing/opening the customization menu and naturally supports
@@ -8117,8 +14067,8 @@ function PollFrontendP2LeaveHold()
 end
 
 local InputState = {
-    [1] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, Voice=false, VehiclePrev=false, VehicleNext=false, Perspective=false },
-    [2] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, Voice=false, VehiclePrev=false, VehicleNext=false, Perspective=false },
+    [1] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, Voice=false, SkinPrev=false, SkinNext=false, VehiclePrev=false, VehicleNext=false, Perspective=false },
+    [2] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, Voice=false, SkinPrev=false, SkinNext=false, VehiclePrev=false, VehicleNext=false, Perspective=false },
 }
 
 KeyboardPendingArmorDelta = KeyboardPendingArmorDelta or 0
@@ -8133,8 +14083,8 @@ KeyboardPendingPerspective = KeyboardPendingPerspective or false
 -- Controllers=1 can leave CommonUI's keyboard Back/Escape route without a
 -- usable P1 target after P2 opens and closes the local pause/settings stack.
 -- Keyboard Escape recovery -----------------------------------------------------
--- In Controllers=1 Halo can leave its native P1 keyboard pause route unusable
--- after P2 has owned and released a fullscreen menu. The release recovery is
+-- In either controller-count mode Halo can leave its native P1 keyboard pause
+-- route unusable after P2 has owned and released a fullscreen menu. Recovery is
 -- deliberately narrow:
 --   1. never consume/replace the physical Escape press;
 --   2. give Halo's native P1 UI route a short grace window;
@@ -8361,14 +14311,14 @@ end
 function KeyboardEscapeScheduleRecovery()
     if not KeyboardEscapePending then return end
     KeyboardEscapePending = false
-    if ConfiguredControllerCount ~= 1 or ModTeardownGuard then return end
+    if (ConfiguredControllerCount ~= 1 and ConfiguredControllerCount ~= 2) or ModTeardownGuard then return end
     if CurrentWorldSessionKind() ~= 'campaign' then return end
     if not IsValidObject(GetPlayer(2)) then return end
 
     local Request = KeyboardEscapeRequestGeneration
     local P1ActivityAtKey = KeyboardEscapeActivityP1AtRequest
     ExecuteInGameThreadWithDelay(KeyboardEscapeRecoveryDelayMs, function()
-        if ModTeardownGuard or ConfiguredControllerCount ~= 1 then return end
+        if ModTeardownGuard or (ConfiguredControllerCount ~= 1 and ConfiguredControllerCount ~= 2) then return end
         if Request ~= KeyboardEscapeRequestGeneration then return end
         if P1ActivityAtKey ~= KeyboardEscapeUiActivityGenerationP1 then
             Log('INPUT ESC recovery: native P1 UI route handled Escape')
@@ -8485,15 +14435,26 @@ function ProcessPendingKeyboardInput()
         end
     end
 
+    if KeyboardPendingClassicSkinDelta ~= 0 then
+        -- V7: drain one queued Classic step per game-thread tick instead of
+        -- collapsing rapid Shift+Arrow presses while a model swap is settling.
+        local Pending = tonumber(KeyboardPendingClassicSkinDelta) or 0
+        local Delta = Pending < 0 and -1 or 1
+        KeyboardPendingClassicSkinDelta = Pending - Delta
+        CycleDefaultSpartanSkin(1, Delta,
+            Delta < 0 and "keyboard Shift+Left" or "keyboard Shift+Right")
+    end
+
     if KeyboardPendingVehicleColorDelta ~= 0 then
         local Delta = KeyboardPendingVehicleColorDelta
         KeyboardPendingVehicleColorDelta = 0
-        CycleOccupiedVehicleColor(1, Delta, Delta < 0 and "keyboard Ctrl+PageUp" or "keyboard Ctrl+PageDown")
+        CycleOccupiedVehicleColor(1, Delta,
+            Delta < 0 and "keyboard Ctrl+PageUp" or "keyboard Ctrl+PageDown")
     end
 
     if KeyboardPendingPerspective then
         KeyboardPendingPerspective = false
-        TogglePerspectiveGlobal("keyboard Ctrl+B")
+        TogglePerspectivePlayer(1, "keyboard Ctrl+B")
     end
 end
 
@@ -8509,6 +14470,8 @@ local function PollPlayerInput(PlayerIndex)
         State.Down = false
         State.Weapon = false
         State.Voice = false
+        State.SkinPrev = false
+        State.SkinNext = false
         State.VehiclePrev = false
         State.VehicleNext = false
         State.Perspective = false
@@ -8526,13 +14489,16 @@ local function PollPlayerInput(PlayerIndex)
     end
 
     local Shoulder = IsKeyDown(Player, KeyRightShoulder)
-    if not Shoulder then
+    local ColorModifier = IsKeyDown(Player, KeyFaceButtonLeft)
+    if not Shoulder and not ColorModifier then
         State.Left = false
         State.Right = false
         State.Up = false
         State.Down = false
         State.Weapon = false
         State.Voice = false
+        State.SkinPrev = false
+        State.SkinNext = false
         State.VehiclePrev = false
         State.VehicleNext = false
         State.Perspective = false
@@ -8548,6 +14514,8 @@ local function PollPlayerInput(PlayerIndex)
     -- P2 must never be able to toggle the host broadcast.
     local VoiceDown = PlayerIndex == 1 and Shoulder and IsKeyDown(Player, KeyFaceButtonTop) or false
     local PerspectiveDown = Shoulder and IsKeyDown(Player, KeyFaceButtonRight) or false
+    local SkinPrevDown = ColorModifier and IsKeyDown(Player, KeyDPadLeft) or false
+    local SkinNextDown = ColorModifier and IsKeyDown(Player, KeyDPadRight) or false
     local VehiclePrevDown = Shoulder and IsKeyDown(Player, KeyLeftThumbstick) or false
     local VehicleNextDown = Shoulder and IsKeyDown(Player, KeyRightThumbstick) or false
 
@@ -8558,6 +14526,8 @@ local function PollPlayerInput(PlayerIndex)
     local WeaponCombo = Shoulder and WeaponDown
     local VoiceCombo = Shoulder and VoiceDown
     local PerspectiveCombo = Shoulder and PerspectiveDown
+    local SkinPrevCombo = SkinPrevDown
+    local SkinNextCombo = SkinNextDown
     local VehiclePrevCombo = Shoulder and VehiclePrevDown
     local VehicleNextCombo = Shoulder and VehicleNextDown
     local LeftPressed = LeftCombo and not State.Left
@@ -8567,6 +14537,8 @@ local function PollPlayerInput(PlayerIndex)
     local WeaponPressed = WeaponCombo and not State.Weapon
     local VoicePressed = VoiceCombo and not State.Voice
     local PerspectivePressed = PerspectiveCombo and not State.Perspective
+    local SkinPrevPressed = SkinPrevCombo and not State.SkinPrev
+    local SkinNextPressed = SkinNextCombo and not State.SkinNext
     local VehiclePrevPressed = VehiclePrevCombo and not State.VehiclePrev
     local VehicleNextPressed = VehicleNextCombo and not State.VehicleNext
     State.Left = LeftCombo
@@ -8576,6 +14548,8 @@ local function PollPlayerInput(PlayerIndex)
     State.Weapon = WeaponCombo
     State.Voice = VoiceCombo
     State.Perspective = PerspectiveCombo
+    State.SkinPrev = SkinPrevCombo
+    State.SkinNext = SkinNextCombo
     State.VehiclePrev = VehiclePrevCombo
     State.VehicleNext = VehicleNextCombo
 
@@ -8621,6 +14595,12 @@ local function PollPlayerInput(PlayerIndex)
         CycleOccupiedVehicleColor(PlayerIndex, 1, string.format("controller P%d RB+RS", PlayerIndex))
     end
 
+    if (SkinPrevPressed or SkinNextPressed) and MissionReady then
+        local Delta = SkinPrevPressed and -1 or 1
+        CycleDefaultSpartanSkin(PlayerIndex, Delta,
+            string.format("controller P%d X+DPAD_%s", PlayerIndex, SkinPrevPressed and "LEFT" or "RIGHT"))
+    end
+
     if LeftPressed then
         PendingApply[PlayerIndex] = -1
     elseif RightPressed then
@@ -8657,9 +14637,24 @@ function ProcessPendingApply()
     end
 
     local FromIndex = CatalogIndex[PlayerIndex]
-    local TargetIndex = FromIndex + Delta
-    Log("INPUT P%d ARMOR apply begin from=%d delta=%d targetRaw=%d",
-        PlayerIndex, FromIndex, Delta, TargetIndex)
+    local TargetIndex, Skipped = FindNextAvailableCustomizationIndex(
+        PlayerIndex, ArmorCatalog, FromIndex, Delta)
+    if TargetIndex == nil or TargetIndex == FromIndex then
+        local Controller = GetPlayer(PlayerIndex)
+        if IsValidObject(Controller) then
+            ScreenMessage(PlayerIndex, Controller, "ARMOR: NO OTHER OWNED MODEL FOUND")
+        end
+        Log("INPUT P%d ARMOR no eligible alternate from=%d delta=%d skipped=%d",
+            PlayerIndex, FromIndex, Delta, tonumber(Skipped) or 0)
+        ApplyBusy = false
+        ApplyCooldownTicks = 5
+        return
+    end
+    Log("INPUT P%d ARMOR apply begin from=%d delta=%d target=%d lockedSkipped=%d",
+        PlayerIndex, FromIndex, Delta, TargetIndex, tonumber(Skipped) or 0)
+    if ArmorSkinPrepareForModelSwap ~= nil then
+        ArmorSkinPrepareForModelSwap(PlayerIndex, "separate armor-model browser")
+    end
     local ApplyOk = ApplyArmorSelection(PlayerIndex, TargetIndex)
     Log("INPUT P%d ARMOR apply result=%s finalIndex=%d",
         PlayerIndex, tostring(ApplyOk == true), CatalogIndex[PlayerIndex])
@@ -8668,8 +14663,8 @@ function ProcessPendingApply()
 end
 
 local function ResetInputState(Reason)
-    InputState[1] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, VehiclePrev=false, VehicleNext=false, Perspective=false }
-    InputState[2] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, VehiclePrev=false, VehicleNext=false, Perspective=false }
+    InputState[1] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, SkinPrev=false, SkinNext=false, VehiclePrev=false, VehicleNext=false, Perspective=false }
+    InputState[2] = { Left=false, Right=false, Up=false, Down=false, Weapon=false, SkinPrev=false, SkinNext=false, VehiclePrev=false, VehicleNext=false, Perspective=false }
     OrientationToggleCooldownTicks = 0
     OrientationToggleRequested = false
     OrientationReapplyRequested = false
@@ -8688,10 +14683,24 @@ local function ResetInputState(Reason)
     KeyboardPendingLives = false
     KeyboardPendingSplit = false
     KeyboardPendingVehicleColorDelta = 0
+    KeyboardPendingClassicSkinDelta = 0
     KeyboardPendingPerspective = false
+    -- V13: never carry an input cooldown or stale queued Classic press across
+    -- respawn/map teardown/menu transitions. Invalidate any delayed unlock callback.
+    if type(ClassicArmorInputCooldownActive) == "table" then
+        ClassicArmorInputCooldownActive[1] = false
+        ClassicArmorInputCooldownActive[2] = false
+    end
+    if type(ClassicArmorInputCooldownToken) == "table" then
+        ClassicArmorInputCooldownToken[1] = (tonumber(ClassicArmorInputCooldownToken[1]) or 0) + 1
+        ClassicArmorInputCooldownToken[2] = (tonumber(ClassicArmorInputCooldownToken[2]) or 0) + 1
+    end
     KeyboardEscapePending = false
     KeyboardEscapeRequestGeneration = KeyboardEscapeRequestGeneration + 1
     KeyboardEscapeActivityP1AtRequest = KeyboardEscapeUiActivityGenerationP1
+    if ArmorSkinDropAllRuntimeRefs ~= nil then
+        ArmorSkinDropAllRuntimeRefs("input reset: " .. tostring(Reason or "state change"))
+    end
     Log("GAMEPLAY input state reset: %s", tostring(Reason or "state change"))
 end
 
@@ -8713,13 +14722,44 @@ ControllerRefreshCounter = 0
 ArmorTickHookRetryTicks = 0
 ArmorTickFallbackRefreshTicks = 0
 
--- Local guest naming. Halo may initially expose a numeric guest (257/258)
--- or a copy of the host profile name. For hybrid co-op, a generic "Player 2" is
--- ambiguous across two PCs, so the local guest becomes "<P1 name> (2)". The
--- repair is bounded to a few post-join samples and has zero steady-state work.
+-- Local guest naming. P2 receives one randomized Spartan-style identity when
+-- the mod-created local player becomes valid, e.g. Rook-308 or Kael-096. The
+-- chosen identity is retained across mission travel and rerolled only after P2
+-- is explicitly removed and created again.
 P2NameRepairActive = false
 P2NameRepairTicks = 0
 P2NameRepairAttempts = 0
+P2SpartanSessionName = P2SpartanSessionName or ""
+P2SpartanRandomState = tonumber(P2SpartanRandomState) or 0
+P2SpartanNamePool = P2SpartanNamePool or {
+    "Elias","Rook","Kellan","Soren","Dax","Talon","Kael","Orin","Jace","Silas",
+    "Niko","Vance","Dorian","Ronan","Axel","Mason","Cade","Drake","Reeve","Knox",
+    "Torin","Bren","Ryker","Zane","Garrick","Nolan","Corbin","Lucan","Merrick","Rafe",
+    "Declan","Seth","Jarek","Damon","Trent","Cole","Wade","Kane","Garrett","Owen",
+    "Landon","Viktor","Caleb","Rowan","Marcus","Evan","Leon","Adrian","Roman","Trevor",
+    "Grant","Connor","Alec","Nathan","Eric","Jason","Logan","Derek","Ethan","Julian"
+}
+
+function P2SpartanRandomNext(MaxValue)
+    MaxValue=math.max(1,math.floor(tonumber(MaxValue) or 1))
+    if P2SpartanRandomState<=0 then
+        local Seed=tonumber(os.time()) or 1
+        Seed=Seed+math.floor((tonumber(os.clock()) or 0)*1000000)+(tonumber(WarthogColorRuntimeGeneration) or 0)*7919
+        P2SpartanRandomState=Seed%2147483647
+        if P2SpartanRandomState<=0 then P2SpartanRandomState=1357911 end
+    end
+    P2SpartanRandomState=(P2SpartanRandomState*48271)%2147483647
+    return (P2SpartanRandomState%MaxValue)+1
+end
+
+function EnsureP2SpartanSessionName()
+    if TrimName(P2SpartanSessionName)~="" then return TrimName(P2SpartanSessionName) end
+    local Base=P2SpartanNamePool[P2SpartanRandomNext(#P2SpartanNamePool)] or "Rook"
+    local Number=P2SpartanRandomNext(999)
+    P2SpartanSessionName=string.format("%s-%03d",tostring(Base),Number)
+    Log("IDENTITY local P2 Spartan identity generated: %s",P2SpartanSessionName)
+    return P2SpartanSessionName
+end
 
 function IdentityString(Value)
     if Value == nil then return "" end
@@ -8775,6 +14815,88 @@ function PlayerStatesAliased(P1, P2)
     return A ~= "" and B ~= "" and A == B
 end
 
+function IdentityControllerIsSecondarySplit(Controller)
+    Controller=Unwrap(Controller)
+    if not IsValidObject(Controller) then return false end
+    local Player=nil
+    pcall(function() Player=Unwrap(Controller.Player) end)
+    local N=string.lower(tostring(SafeFullName(Player) or Player or ""))
+    return string.find(N,"childconnection",1,true)~=nil
+end
+
+function IdentityNetworkMaybeSendP2NameFrontend(Source)
+    local C2=Unwrap(GetPlayer(2))
+    if not IsValidObject(C2) then C2=Unwrap(PlayerControllerTable and PlayerControllerTable[2] or nil) end
+    local Name=TrimName(P2SpartanSessionName)
+    if not IsValidObject(C2) or not string.match(Name,"^[A-Za-z]+%-%d%d%d$") or #Name>24 then return false end
+    local Pid=ArmorSkinPlayerIdFromController(C2)
+    if Pid==nil then Pid=NetworkIdentityRemotePlayerId(C2) end
+    if Pid==nil then return false end
+    local Sig=string.format("%d:%s",math.floor(Pid),Name)
+    -- A successful local ServerExecRPC invocation is not proof that the frontend
+    -- net connection was already ready, so do not suppress the bounded retries.
+    IdentityNameUplinkSequence=(tonumber(IdentityNameUplinkSequence) or 0)+1
+    local Msg=string.format("HCECENM|%d|%d|%d|%s",IdentityNameProtocol,IdentityNameUplinkSequence,math.floor(Pid),Name)
+    local Ok,Err=pcall(function() C2:ServerExecRPC(Msg) end)
+    if Ok then
+        IdentityFrontendNameLastSignature=Sig
+        Log("IDENTITY P2 NAME FRONTEND UPLINK TX seq=%d playerId=%d name='%s' route=%s source=%s",
+            IdentityNameUplinkSequence,Pid,Name,tostring(SafeFullName(C2) or C2),tostring(Source or "P2 frontend name"))
+        return true
+    end
+    Log("IDENTITY P2 NAME FRONTEND UPLINK failed playerId=%s name='%s' error=%s",tostring(Pid),Name,tostring(Err))
+    return false
+end
+
+function IdentityNetworkScheduleFrontendP2NamePublish(Source)
+    IdentityFrontendNamePublishToken=(tonumber(IdentityFrontendNamePublishToken) or 0)+1
+    local Token=IdentityFrontendNamePublishToken
+    local Delays={0,250,600,1200,2200,4000}
+    for _,Delay in ipairs(Delays) do
+        ExecuteInGameThreadWithDelay(Delay,function()
+            if Token~=IdentityFrontendNamePublishToken or ModTeardownGuard then return end
+            -- Intentionally send every bounded attempt. The client can observe its
+            -- own reflected call even when the lobby connection is not ready yet;
+            -- only the host can prove receipt, and duplicate authoritative writes
+            -- of the same generated name are harmless.
+            IdentityNetworkMaybeSendP2NameFrontend(string.format("%s +%dms",tostring(Source or "P2 join"),Delay))
+        end)
+    end
+end
+
+-- Mission-time P2 name resend via the retired armor route-proof map was removed.
+-- The bounded frontend P2-name publisher remains independent and is handled by
+-- HCECENM using the secondary ChildConnection proof on the host.
+
+function IdentityNetworkHandleNameUplink(Message,Controller,ControllerToken)
+    local Proto,Seq,Claimed,Name=string.match(Message,"^HCECENM|(%d+)|(%d+)|(%d+)|([A-Za-z]+%-%d%d%d)$")
+    Proto,Seq,Claimed=tonumber(Proto),tonumber(Seq),tonumber(Claimed)
+    Controller=Unwrap(Controller)
+    if Proto~=IdentityNameProtocol or Seq==nil or Claimed==nil or not IsValidObject(Controller) or Name==nil or #Name>24 then
+        Log("IDENTITY P2 NAME UPLINK rejected client=%s reason=invalid-payload",tostring(ControllerToken)); return
+    end
+    local ServerPid=ArmorSkinPlayerIdFromController(Controller)
+    local Secondary=(IdentityControllerIsSecondarySplit~=nil and IdentityControllerIsSecondarySplit(Controller))
+    if ServerPid==nil or math.floor(ServerPid)~=math.floor(Claimed) or not Secondary then
+        Log("IDENTITY P2 NAME UPLINK rejected client=%s claimed=%s server=%s child=%s",
+            tostring(ControllerToken),tostring(Claimed),tostring(ServerPid),tostring(Secondary)); return
+    end
+    local Last=tonumber(IdentityNameLastUplinkSequenceByController[ControllerToken])
+    if Last~=nil and Seq<=Last then return end
+    IdentityNameLastUplinkSequenceByController[ControllerToken]=Seq
+    if not IsValidObject(Controller.PlayerState) then return end
+    local Before=NetworkIdentityRemotePlayerName(Controller)
+    local WriteOk=pcall(function() Controller.PlayerState.PlayerNamePrivate=Name end)
+    local RepOk=false
+    if WriteOk then
+        RepOk=pcall(function() Controller.PlayerState:OnRep_PlayerName() end)
+        pcall(function() Controller.PlayerState:ForceNetUpdate() end)
+    end
+    local After=NetworkIdentityRemotePlayerName(Controller)
+    Log("IDENTITY P2 NAME UPLINK RX seq=%d playerId=%d write=%s onrep=%s before='%s' target='%s' after='%s' client=%s",
+        Seq,ServerPid,tostring(WriteOk),tostring(RepOk),tostring(Before),tostring(Name),tostring(After),tostring(ControllerToken))
+end
+
 function TryRepairP2Name()
     local P1, P2 = PlayerControllerTable[1], PlayerControllerTable[2]
     if not IsValidObject(P1) or not IsValidObject(P2) then
@@ -8784,24 +14906,20 @@ function TryRepairP2Name()
     if not IsValidObject(P1) or not IsValidObject(P2) then return false end
 
     local P1Name = ReadPlayerName(P1)
-    if not NameReady(P1Name) then return false end
-    local Target = P1Name .. " (2)"
+    local Target = EnsureP2SpartanSessionName()
+    if TrimName(Target)=="" then return false end
     local Before = ReadPlayerName(P2)
     if string.lower(TrimName(Before)) == string.lower(Target) then return true end
     if PlayerStatesAliased(P1, P2) then return false end
 
-    local Lower = string.lower(TrimName(Before))
-    local P1Lower = string.lower(TrimName(P1Name))
-    local GuestLike = Before == "" or string.match(TrimName(Before), "^%d+$") ~= nil or
-        Lower == P1Lower or Lower == "player 2"
-    if not GuestLike then
-        Log("IDENTITY P2 has distinct profile name '%s'; leaving it untouched", tostring(Before))
-        return true
-    end
-
     local WriteOk = pcall(function() P2.PlayerState.PlayerNamePrivate = Target end)
     local RepOk = false
-    if WriteOk then RepOk = pcall(function() P2.PlayerState:OnRep_PlayerName() end) end
+    if WriteOk then
+        RepOk = pcall(function() P2.PlayerState:OnRep_PlayerName() end)
+        if LivesAuthorityResolved and LivesAuthorityAllowed==true then
+            pcall(function() P2.PlayerState:ForceNetUpdate() end)
+        end
+    end
     local After = ReadPlayerName(P2)
     local P1After = ReadPlayerName(P1)
     if WriteOk and TrimName(P1After) ~= TrimName(P1Name) then
@@ -8814,6 +14932,11 @@ function TryRepairP2Name()
     Log("IDENTITY local guest repair attempt=%d write=%s onrep=%s p1='%s' before='%s' target='%s' after='%s'",
         P2NameRepairAttempts, tostring(WriteOk), tostring(RepOk), tostring(P1Name),
         tostring(Before), tostring(Target), tostring(After))
+    if Repaired then
+        if IdentityNetworkScheduleFrontendP2NamePublish~=nil then
+            IdentityNetworkScheduleFrontendP2NamePublish("local P2 repair")
+        end
+    end
     return Repaired
 end
 
@@ -9131,7 +15254,7 @@ function ApplyControllerHelpToLiveMenu()
                     WidgetWrites = WidgetWrites + ControllerHelpSetAction(
                         DpadLeft,
                         "dpad_left",
-                        "RB: Previous Armor"
+                        "X: Previous Armor Skin\nRB: Previous Armor Model"
                     )
                     WidgetWrites = WidgetWrites + ControllerHelpSetAction(
                         DpadDown,
@@ -9141,12 +15264,12 @@ function ApplyControllerHelpToLiveMenu()
                     WidgetWrites = WidgetWrites + ControllerHelpSetAction(
                         DpadRight,
                         "dpad_right",
-                        "Switch Grenade\nRB: Next Armor"
+                        "Switch Grenade\nX: Next Armor Skin\nRB: Next Armor Model"
                     )
                     WidgetWrites = WidgetWrites + ControllerHelpSetAction(
                         FaceLeft,
                         "face_left",
-                        "Interact / Reload\nRB: Weapon Skin"
+                        "Interact / Reload\nHold: Armor Skin\nRB: Weapon Skin"
                     )
                     WidgetWrites = WidgetWrites + ControllerHelpSetAction(
                         FaceRight,
@@ -11748,10 +17871,28 @@ function MissionTick(ControllerId, Controller, SharedControllerName, SharedFulls
             end
         end
         MissionReady = true
+        if ArmorSkinSchedulePlayerMIDPrewarm ~= nil then
+            ArmorSkinSchedulePlayerMIDPrewarm("stable mission HUD/controller")
+        end
         SelectionTouched = false
         StartingExtraLives = 0
         SimulatedLives = 0
         MissionLivesEnabled = false
+
+        if HasSecondLocalPlayer and TrimName(P2SpartanSessionName)~="" then
+            P2NameRepairActive=true
+            P2NameRepairTicks=0
+            P2NameRepairAttempts=0
+            SchedulePlayerTwoNameRepair(1)
+        end
+
+        -- RC3_43: hydrate logical remote colors before capability/snapshot traffic
+        -- starts in the new world. This keeps same-fireteam mission travel from
+        -- briefly reverting remote Spartans to authored green while waiting for
+        -- a fresh client uplink.
+        if ArmorSkinPersistentRestoreRemoteStates ~= nil then
+            ArmorSkinPersistentRestoreRemoteStates("stable mission pre-capability")
+        end
 
         if AuthorityAllowed then
             SetupActive = true
@@ -11761,11 +17902,17 @@ function MissionTick(ControllerId, Controller, SharedControllerName, SharedFulls
             if not VehicleMessageCapabilityMissionPrimed then
                 VehicleMessageCapabilityPrimeMission()
             end
+            if ArmorSkinScheduleTrackedReapply ~= nil then
+                ArmorSkinScheduleTrackedReapply("stable mission HUD/controller")
+            end
             Log("LIVES stable mission HUD ready; setup OPEN mode=%s authority=host/standalone default=OFF waitingForFirstInput=true idleDelay=%.1fs header=%.1fs digits=%ds",
                 HasSecondLocalPlayer and "local-coop" or "solo",
                 IdleBeforeCountdownSeconds, CountdownHeaderMs / 1000.0, CountdownSeconds)
         else
             DisableLimitedRespawnsForNetworkClient("stable mission HUD/controller", true)
+            if ArmorSkinScheduleTrackedReapply ~= nil then
+                ArmorSkinScheduleTrackedReapply("stable network-client mission HUD/controller")
+            end
             Log("LIVES stable mission HUD ready; setup BLOCKED mode=network-client host-P1-only")
         end
     end
@@ -11790,6 +17937,7 @@ function ArmorControllerTickBody(ControllerId, Controller, RawFrameDeltaSeconds,
     end
     if ControllerId == 0 then ProcessPendingKeyboardInput() end
     PollPlayerInput(PlayerIndex)
+    if ArmorSkinMaintenanceTick ~= nil then ArmorSkinMaintenanceTick(PlayerIndex) end
     if ControllerId == 0 then ProcessPendingApply() end
 end
 
@@ -11862,13 +18010,17 @@ function StartGameplaySystems()
     if MainStateWorkerStarted then return end
     MainStateWorkerStarted = true
     RegisterArmorTickHook()
+    -- Native cooked Classic12 uses Halo's normal customization/replication path;
+    -- the retired biped/MID armor-network presentation listener is not started.
+    RegisterClassicArmorMenuActivationHook()
+    RegisterClassicArmorMenuListListener()
     RegisterLivesPlayerDeathConstructionListener()
     RegisterLivesHooks()
     RegisterPauseCloseHudHook()
     RegisterCinematicHooks()
     -- Limited Respawns selection is mission-only; the frontend does not run it.
     Log("Limited Respawns ready: standalone/local co-op/network-host P1 only; network clients auto-disable; reinforcement after %ds at zero lives.", ReinforcementDelaySeconds)
-    Log("Armor switching ready: 27 switchable armor options.")
+    Log("Armor switching ready: authored Owned/entitled models plus integrated default-Spartan skin cycling.")
     RestartJoinStateMachineWorker("startup")
 end
 
@@ -11917,6 +18069,18 @@ RegisterKeyBind(Key.RIGHT_ARROW, {ModifierKey.CONTROL}, function()
     Log("ARMOR keyboard shortcut queued: Ctrl+Right")
 end)
 
+-- Classic Spartan color is deliberately independent from vehicle context.
+-- It therefore works both on foot and while seated in a vehicle.
+RegisterKeyBind(Key.LEFT_ARROW, {ModifierKey.SHIFT}, function()
+    KeyboardPendingClassicSkinDelta = (tonumber(KeyboardPendingClassicSkinDelta) or 0) - 1
+    Log("CLASSIC keyboard shortcut queued: Shift+Left pending=%d", tonumber(KeyboardPendingClassicSkinDelta) or 0)
+end)
+
+RegisterKeyBind(Key.RIGHT_ARROW, {ModifierKey.SHIFT}, function()
+    KeyboardPendingClassicSkinDelta = (tonumber(KeyboardPendingClassicSkinDelta) or 0) + 1
+    Log("CLASSIC keyboard shortcut queued: Shift+Right pending=%d", tonumber(KeyboardPendingClassicSkinDelta) or 0)
+end)
+
 RegisterKeyBind(Key.X, {ModifierKey.CONTROL}, function()
     KeyboardPendingWeaponSkin = true
     KeyboardPendingWeaponSkinLabel = "Ctrl+X"
@@ -11942,12 +18106,12 @@ end)
 
 RegisterKeyBind(Key.PAGE_UP, {ModifierKey.CONTROL}, function()
     KeyboardPendingVehicleColorDelta = -1
-    Log("VEHICLE color browser keyboard shortcut queued: Ctrl+PageUp")
+    Log("VEHICLE COLOR keyboard shortcut queued: Ctrl+PageUp")
 end)
 
 RegisterKeyBind(Key.PAGE_DOWN, {ModifierKey.CONTROL}, function()
     KeyboardPendingVehicleColorDelta = 1
-    Log("VEHICLE color browser keyboard shortcut queued: Ctrl+PageDown")
+    Log("VEHICLE COLOR keyboard shortcut queued: Ctrl+PageDown")
 end)
 
 RegisterKeyBind(Key.B, {ModifierKey.CONTROL}, function()
@@ -11955,11 +18119,11 @@ RegisterKeyBind(Key.B, {ModifierKey.CONTROL}, function()
     Log("PERSPECTIVE keyboard shortcut queued: Ctrl+B")
 end)
 
--- Do not consume or replace Halo's normal Escape behavior. In Controllers=1 we
--- only arm a delayed P1/CommonUI fallback; native P1 activation/deactivation
+-- Do not consume or replace Halo's normal Escape behavior. In Controllers=1/2
+-- we only arm a delayed P1/CommonUI fallback; native P1 activation/deactivation
 -- cancels the fallback before it can run. P2 UI churn is deliberately ignored.
 RegisterKeyBind(Key.ESCAPE, function()
-    if ConfiguredControllerCount == 1 then
+    if ConfiguredControllerCount == 1 or ConfiguredControllerCount == 2 then
         KeyboardEscapeRequestGeneration = KeyboardEscapeRequestGeneration + 1
         KeyboardEscapeActivityP1AtRequest = KeyboardEscapeUiActivityGenerationP1
         KeyboardEscapePending = true
@@ -11968,17 +18132,18 @@ end)
 
 RegisterKeyboardEscapeRecoveryHooks()
 
-Log("Co-op Expanded v1.10.0 loaded.")
+Log("Co-op Expanded v1.11.0 development build loaded.")
 Log("Frontend split-screen join/leave ready: A sign-in; hold A on P2 about 2s to leave; Ctrl+Y/Ctrl+U fallbacks.")
-Log("Gameplay features ready: split orientation, armor switching, Limited Respawns, vanilla-compatible voice announcements, HUD and cinematic fixes.")
-Log("Weapon skin switching ready: 7 verified weapon families; RB+X or Ctrl+X.")
-Log("Vehicle color switching ready: Warthog + Scorpion, 18 original Halo CE colors; RB+LS/RS or Ctrl+PageUp/PageDown; DRIVER ONLY; network sync enabled between capability-confirmed Co-op Expanded peers.")
-Log("Perspective switching ready: RB+B toggles each local player independently; Ctrl+B remains the keyboard/global fallback.")
+Log("Gameplay features ready: split orientation, armor models + default-Spartan skins, Limited Respawns, vanilla-compatible voice announcements, HUD and cinematic fixes.")
+Log("Weapon skin switching ready: 7 verified weapon families; Owned/entitled rows only; RB+X or Ctrl+X.")
+Log("Color cycling ready: Spartan Classic = X+DPad Left/Right or Shift+Left/Right in any context; vehicle paint = RB+LS/RS or Ctrl+PageUp/PageDown; same Halo CE order.")
+Log("Perspective switching ready: RB+B toggles each local player independently; Ctrl+B toggles P1 only.")
 Log("Limited Respawns voice announcements ready: default=ON; host P1 RB+Y or Ctrl+F8 toggles broadcast; toggle banner=4.0s; death voice coalesces for 0.50s; modded HUD text remains always enabled.")
 Log("Vehicle network sync ready: capability-gated protocol=3, proven ACK/READY uplink route, one-shot mission discovery, no periodic network polling.")
+Log("Armor customization sync ready: native cooked rows use Halo's ordinary replication; retired custom ARMORSKIN NET transport is disabled.")
 Log("Perspective network-client local split routing ready: Steam uses native 1=P1/2=P2; WinGDK compensates its reversed local camera order in Lua; context 0 stays vanilla.")
 Log("UI CONTROLS ready: Controller Settings help covers frontend and per-player pause stacks; construction/activation/nav plus target TextBlock/visibility refresh driven; bounded retries only.")
-Log("INPUT ESC recovery ready: Controllers=1 uses HaloUI OpenWidgetFullscreen fallback after failed native P1 Escape; P2 ownership is preserved and SetCurrentFullscreenPlayer is never called directly.")
+Log("INPUT ESC recovery ready: Controllers=1/2 use HaloUI OpenWidgetFullscreen fallback after failed native P1 Escape; P2 ownership is preserved and SetCurrentFullscreenPlayer is never called directly.")
 Log("INPUT ROUTER ready: Controllers=1 router v0.7.4 validates logical P2 liveness, recovers late Steam Input publication, and keeps WinGDK native Xbox/XInput only.")
 
 -- Map travel rebuilds the player layers and can discard the corrected geometry.
@@ -12103,11 +18268,15 @@ PostLoadHookOk, PostLoadHookErr = pcall(function()
 
                 -- Keep any legacy fallback carrier while travelling into campaign.
                 -- Clear it on return to Frontend so a future fallback discovers fresh UI objects.
-                local WorldName = ""
-                pcall(function() WorldName = SafeToString(UEHelpers.GetWorldContextObject()) end)
-                local LowerWorld = string.lower(WorldName or "")
-                if string.find(LowerWorld, "/game/levels/ui/frontend/", 1, true) then
+                local SessionKind = CurrentWorldSessionKind()
+                if SessionKind == "frontend" then
                     ClearCarrier("returned to frontend")
+                    if ArmorSkinTexturePrewarmComplete ~= true and ArmorSkinTexturePrewarmPass ~= nil then
+                        pcall(function() ArmorSkinTexturePrewarmPass("settled frontend lifecycle immediate") end)
+                    end
+                    if ArmorSkinTexturePrewarmComplete ~= true and ArmorSkinScheduleTexturePrewarm ~= nil then
+                        ArmorSkinScheduleTexturePrewarm("settled frontend lifecycle retry")
+                    end
                 else
                     Log("ARMOR retaining customization carrier across campaign travel")
                 end
@@ -12152,4 +18321,214 @@ end)
 
 if not PostLoadHookOk then
     Log("Could not register post-load HUD rebuilds: %s", tostring(PostLoadHookErr))
+end
+
+-- Legacy runtime Classic-overlay experiment removed for v1.11.0.
+-- Classic12 now uses native cooked customization rows below.
+
+
+
+
+
+
+-- CLASSIC12_NATIVE_GUARD: native cooked customization owns Classic armor.
+-- The old vehicle-style Classic armor replication experiment is retired.
+-- Disable every remaining runtime overlay/custom-armor-network entry point so
+-- only Halo's native cooked customization replication can own armor state.
+do
+    local disabled = {
+        'ArmorSkinApplyToPawn', 'ArmorSkinApplySharedPlayerColor',
+        'ArmorSkinApplyColorLegacyToExistingItem', 'ArmorSkinApplyColorToExistingItem',
+        'ArmorSkinForceReassertPlayerState', 'ArmorSkinRestoreTarget',
+        'ArmorSkinMaintenanceTick', 'ArmorSkinScheduleLocalApply',
+        'ArmorSkinScheduleNetworkApply', 'ArmorSkinScheduleTrackedReapply',
+        'ArmorSkinSchedulePerspectiveFirstPersonRebind',
+        'ArmorSkinScheduleRespawnRemoteIdentityRetry', 'ArmorSkinScheduleRespawnSettledRebind',
+        'ArmorSkinScheduleLocalStateReassert', 'ArmorSkinSchedulePlayerMIDPrewarm',
+        'ArmorSkinScheduleTexturePrewarm', 'ArmorSkinTexturePrewarmPass',
+        'ArmorSkinPrewarmPlayerMIDSet', 'ArmorSkinPrewarmSafeKnownIds',
+        'ArmorSkinScheduleRespawnPairVectorRepublish',
+        'ArmorSkinNetworkRememberOriginSlot', 'ArmorSkinNetworkOriginSlotForPlayerId'
+    }
+    for _, key in ipairs(disabled) do
+        if type(_G[key]) == 'function' then
+            _G[key] = function() return false, 'CLASSIC12_NATIVE_GUARD: legacy overlay disabled' end
+        end
+    end
+    print('[CLASSIC12_NATIVE] legacy overlay disabled; native cooked selection active\n')
+end
+
+
+
+-- CLASSIC12_NATIVE: cooked variants and persisted frontend initialization.
+do
+    local definitions = {
+        {18,'WHITE','ClassicWhite'}, {1,'BLACK','ClassicBlack'},
+        {2,'RED','ClassicRed'}, {3,'BLUE','ClassicBlue'},
+        {9,'CYAN','ClassicCyan'}, {11,'ORANGE','ClassicOrange'},
+        {4,'GRAY','OriginalCE'}, {5,'YELLOW','Ship_005'},
+        {8,'PURPLE','Ship_006'}, {10,'COBALT','Ship_011'},
+        {15,'TAN','Ship_007'}, {17,'SALMON','Ship_008'},
+    }
+    local byIndex, byTag = {}, {}
+    local function log(s) print('[CLASSIC12_NATIVE] '..tostring(s)..'\n') end
+
+    -- The early xinput1_4 bootstrap writes this marker only after the matching
+    -- cooked native package is active. Lua follows the actual installed mode,
+    -- not merely the requested settings.ini value.
+    local replaceStock=true
+    local modeFile=io.open(GetModFilePath('classic_active_mode.txt'),'r')
+    if modeFile then
+        replaceStock=modeFile:read('*a'):match('^%s*0%s*$')==nil
+        modeFile:close()
+    end
+    if not replaceStock then
+        -- Mode 0 keeps only the six Classic colors with dedicated native tags.
+        -- The six shared tags are stock armor again in the Mode0 cooked package.
+        for i=#definitions,7,-1 do table.remove(definitions,i) end
+    end
+    log('ACTIVE ReplaceStockArmorWithClassic='..(replaceStock and '1' or '0'))
+
+    for _, d in ipairs(definitions) do
+        local c = {index=d[1], name=d[2], tag='Blam.Customization.MasterChief.'..d[3]}
+        byIndex[c.index]=c; byTag[string.lower(c.tag)]=c
+    end
+
+    -- Native customization table supplies the 12 rows. Stop legacy duplicate rows/replays.
+    ClassicArmorMenuEntryPaths = {}
+    ClassicArmorInjectMenuRows = function() return true end
+    ClassicArmorInsertRowsBeforePremium = function() return false end
+    ClassicArmorSyncMenuSelection = function() return false end
+    ClassicArmorReplayExactSelection = function() return false, 'native rows' end
+    local oldEntryColor = ClassicArmorMenuColorIndex
+    function ClassicArmorMenuColorIndex(entry)
+        local skin=''
+        pcall(function() skin=GetTagName(Unwrap(entry).SkinGameplayTag) or '' end)
+        local c=byTag[string.lower(skin)]
+        if c then return c.index,c.name end
+        local index,name=oldEntryColor(entry)
+        if byIndex[index] then return index,name end
+        return nil,nil
+    end
+
+    local function applyNative(player,index,source)
+        local c=byIndex[tonumber(index)]
+        if not c then return true,'not Classic' end
+        local settings,why=GetUserSettings(player)
+        local controller=GetPlayer(player)
+        local statics=GetWeaponSkinNativeStatics()
+        if not IsValidObject(settings) then return false,tostring(why) end
+        if not IsValidObject(controller) or not IsValidObject(statics) then return false,'native controller not ready' end
+        local ok,detail=pcall(function()
+            local current=FindMasterChiefSelection(settings)
+            local target=MakeGameplayTag(c.tag)
+            settings:AddOrReplaceCustomization(Unwrap(current) or target,target)
+            settings:ApplyHaloUserSettings()
+            statics:SetEquippedObjectSkin(controller,target)
+        end)
+        local _,after=FindMasterChiefSelection(settings)
+        local committed=ok and string.lower(tostring(after))==string.lower(c.tag)
+        log('APPLY P'..player..' color='..c.name..' source='..source..' stored='..tostring(after)..' ok='..tostring(committed)..' detail='..tostring(detail))
+        return committed,detail
+    end
+
+    function ApplyClassicArmorSkin(player,index,source)
+        player=tonumber(player) or 1;index=tonumber(index)
+        if not byIndex[index] then return false,'removed Classic color' end
+        ClassicArmorSetPersistentSelection(player,index,source or 'native Classic selection')
+        return applyNative(player,index,source or 'menu')
+    end
+
+    -- Keyboard and controller already dispatch here on the game thread.
+    -- Replace the old 18-color overlay path with the same native selection as the menu.
+    function CycleDefaultSpartanSkin(player,delta,source)
+        player=tonumber(player) or 1
+        delta=tonumber(delta) or 0
+        if delta==0 then return false,'no direction' end
+        local order={}
+        for _,index in ipairs({1,2,3,4,5,8,9,10,11,15,17,18}) do
+            if byIndex[index] then order[#order+1]=index end
+        end
+        local settings=GetUserSettings(player)
+        if not IsValidObject(settings) then return false,'settings not ready' end
+        local _,tag=FindMasterChiefSelection(settings)
+        local current=byTag[string.lower(tostring(tag or ''))]
+        local position=nil
+        for i,index in ipairs(order) do
+            if current and index==current.index then position=i;break end
+        end
+        local step=delta<0 and -1 or 1
+        local nextPosition=position and ((position-1+step)%#order+1) or (step>0 and 1 or #order)
+        return ApplyClassicArmorSkin(player,order[nextPosition],source or 'native Classic cycle')
+    end
+
+    -- Ctrl+arrows and RB+D-pad share this catalog selector. Keep native Classic
+    -- rows available to the menu, but skip only the Classic rows active in this mode.
+    local previousNext=FindNextAvailableCustomizationIndex
+    function FindNextAvailableCustomizationIndex(player,catalog,current,delta)
+        if catalog~=ArmorCatalog then return previousNext(player,catalog,current,delta) end
+        if not catalog or #catalog==0 then return nil,0 end
+        local direction=(tonumber(delta) or 1)<0 and -1 or 1
+        local index=tonumber(current) or 1
+        for skipped=0,#catalog-1 do
+            index=(index-1+direction)%#catalog+1
+            local entry=catalog[index]
+            if not byTag[string.lower(tostring(entry.Skin or ''))]
+                and IsCustomizationEntryAvailable(player,entry) then
+                return index,skipped
+            end
+        end
+        return nil,#catalog
+    end
+
+    -- Preserve/cancel saved Classic selection when using the existing stock cycling controls.
+    local previousDirect=ApplyDirect
+    function ApplyDirect(player,entry)
+        local ok,detail=previousDirect(player,entry)
+        if ok then
+            local c=byTag[string.lower(tostring(entry.Skin or ''))]
+            ClassicArmorSetPersistentSelection(player,c and c.index or 0,'native armor cycle')
+        end
+        return ok,detail
+    end
+
+    ClassicArmorLoadPersistentState()
+    for player=1,2 do
+        local saved=tonumber(ClassicArmorMenuSelectedByPlayer[player]) or 0
+        if saved~=0 and not byIndex[saved] then
+            ClassicArmorSetPersistentSelection(player,0,'removed color migration')
+            log('P'..player..' removed saved color='..saved..'; automatic Classic restore cleared')
+        end
+    end
+
+    local generation=0
+    local function schedule(source)
+        generation=generation+1
+        local token=generation
+        local committed={}
+        local function attempt(n)
+            if token~=generation or ModTeardownGuard or CurrentWorldSessionKind()~='frontend' then return end
+            if n>60 then log('FRONTEND timeout source='..source);return end
+            ExecuteInGameThreadWithDelay(n==1 and 3000 or 1000,function()
+                if token~=generation or ModTeardownGuard or CurrentWorldSessionKind()~='frontend' then return end
+                local waiting=false
+                for player=1,2 do
+                    local index=tonumber(ClassicArmorMenuSelectedByPlayer[player]) or 0
+                    if byIndex[index] and committed[player]~=index then
+                        local ok=applyNative(player,index,source)
+                        if ok then committed[player]=index else waiting=true end
+                    end
+                end
+                if waiting then attempt(n+1) else log('FRONTEND completed source='..source..'; ordinary skins untouched') end
+            end)
+        end
+        attempt(1)
+    end
+    local listener,why=pcall(function()
+        NotifyOnNewObject('/Game/UI/Shared/Widgets/Squad/WBP_SquadWidget.WBP_SquadWidget_C',function()
+            if CurrentWorldSessionKind()=='frontend' then schedule('squad widget') end
+        end)
+    end)
+    schedule('startup')
+    log('READY '..tostring(#definitions)..' cooked Classic colors; restore only saved Classic; legacy IDs preserved; listener='..tostring(listener)..' '..tostring(why))
 end

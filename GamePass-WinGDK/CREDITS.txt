@@ -1,8 +1,37 @@
-GAME PASS / WINGDK LOCAL CO-OP CREDIT
+HCE CO-OP EXPANDED v1.11.0 - CREDITS
 =====================================
-Game Pass workaround direction / split-screen research: bfixer117 / HCE Revival
-Repeatable controller/sign-in sequence testing/documentation: red2k1
 
-HCE Co-op Expanded v1.10.0 supports WinGDK local split-screen through the shared
-main.lua platform-user join path plus the documented manual offline transition.
-See README-MANUAL-OFFLINE-WORKAROUND.txt for the tested sequence.
+PROJECT / UPSTREAM
+------------------
+- JPurd123 - Halo Campaign Evolved Split-screen Coop foundation.
+- Narknon - RE-UE4SS SplitScreenMod example / upstream MIT foundation.
+- JoacoL999 / joaqo455 - side-by-side split-screen, two-gamepad routing, HUD
+  scale correction and HUD geometry diagnostic contributions retained under
+  license.
+
+HCE REVIVAL
+-----------
+- bfixer117 / HCE Revival - technical reference and foundation for HUD anchoring,
+  Halo-native load confirmation, one-controller routing and the Game Pass local
+  co-op workaround direction/foundation.
+
+PERSPECTIVE REFERENCE
+---------------------
+- beanzrod - Instant 1st to 3rd Person Toggle used as a technical reference while
+  researching live Perspective behavior. Runtime DLL is not redistributed.
+
+HIDDEN CUSTOMIZATION REFERENCE
+------------------------------
+- goldenchrome - Hidden Skins Unlocker used as a technical reference while
+  researching hidden armor/weapon customization behavior.
+  https://www.nexusmods.com/halocampaignevolved/mods/22
+  No source code or assets from Hidden Skins Unlocker are included in Co-op
+  Expanded.
+
+GAME PASS TESTING / COMPATIBILITY FEEDBACK
+------------------------------------------
+- red2k1 - Game Pass split-screen testing and compatibility feedback, including
+  identification of the two-controller requirement during testing.
+
+The offline/sign-in workaround itself is not credited to red2k1; its direction /
+foundation remains associated with bfixer117 / HCE Revival.
